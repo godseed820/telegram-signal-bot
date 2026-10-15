@@ -1,0 +1,14 @@
+{
+  "name": "telegram-signal-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Telegram futures signals using public Binance USDⓈ-M 15-minute market data.",
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  }
+}
