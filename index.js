@@ -9,7 +9,7 @@ const activeMonitors = new Map();
 
 let persistenceQueue = Promise.resolve();
 let nextPublicRequestAt = 0;
-const AUTO_SCAN_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];[span_0](start_span)[span_0](end_span)[span_1](start_span)[span_1](end_span)
+const AUTO_SCAN_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
 const AUTO_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000;
 const SUBSCRIBERS_FILE = resolve(process.cwd(), "auto-subscribers.json");
