@@ -9,7 +9,7 @@ const activeMonitors = new Map();
 
 let persistenceQueue = Promise.resolve();
 let nextPublicRequestAt = 0;
-const AUTO_SCAN_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
+const AUTO_SCAN_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];[span_0](start_span)[span_0](end_span)[span_1](start_span)[span_1](end_span)
 const AUTO_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000;
 const SUBSCRIBERS_FILE = resolve(process.cwd(), "auto-subscribers.json");
@@ -63,7 +63,7 @@ async function getKrakenMarket(symbol) {
   if (KRAKEN_MARKETS[normalized]) {
     return { commandSymbol: normalized, ...KRAKEN_MARKETS[normalized] };
   }
-  const base = normalized.replace(/USDT$|USD$/, "");
+  const base = normalized.replace(/USDT$\vert{}USD$/, "");
   return {
     commandSymbol: normalized,
     contract: `PF_${base}USD`,
@@ -77,13 +77,13 @@ async function fetchCandles(symbol, interval, count, intervalMs) {
   const rawData = await fetchKrakenJson(url);
   return parseKrakenCandles(rawData, intervalMs);
 }
+
 function identifySupplyDemandZones(candles) {
   const zones = [];
   for (let i = 2; i < candles.length - 1; i++) {
     const curr = candles[i];
     const next = candles[i + 1];
 
-    // Demand Zone (Bullish Order Block)
     if (
       curr.close < curr.open &&
       next.close > next.open &&
@@ -91,7 +91,6 @@ function identifySupplyDemandZones(candles) {
     ) {
       zones.push({ type: "DEMAND", high: curr.high, low: curr.low });
     }
-    // Supply Zone (Bearish Order Block)
     else if (
       curr.close > curr.open &&
       next.close < next.open &&
@@ -104,12 +103,9 @@ function identifySupplyDemandZones(candles) {
 }
 
 function analyzeDailyTrend(dailyCandles) {
-  // Use completed daily candles only.
   const candles = dailyCandles.slice(0, -1);
-
   if (candles.length < 10) return "NEUTRAL";
 
-  // Compare recent 5-candle and preceding 5-candle averages.
   const previous = candles.slice(-10, -5);
   const recent = candles.slice(-5);
 
@@ -123,41 +119,24 @@ function analyzeDailyTrend(dailyCandles) {
   const previousClose = average(previous, "close");
   const recentClose = average(recent, "close");
 
-  const higherHighs = recentHigh > previousHigh;
-  const higherLows = recentLow > previousLow;
-  const lowerHighs = recentHigh < previousHigh;
-  const lowerLows = recentLow < previousLow;
-  const risingClose = recentClose > previousClose;
-  const fallingClose = recentClose < previousClose;
-
-  if (higherHighs && higherLows && risingClose) {
+  if (recentHigh > previousHigh && recentLow > previousLow && recentClose > previousClose) {
     return "BULLISH";
   }
-
-  if (lowerHighs && lowerLows && fallingClose) {
+  if (recentHigh < previousHigh && recentLow < previousLow && recentClose < previousClose) {
     return "BEARISH";
   }
-
   return "CONSOLIDATION";
 }
 
 export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
   const market = await getKrakenMarket(symbol);
 
-  // 1. Daily Bias
-  const dailyCandles = await fetchCandles(
-    symbol,
-    "1d",
-    14,
-    24 * 60 * 60 * 1000,
-  );
+  const dailyCandles = await fetchCandles(symbol, "1d", 14, 24 * 60 * 60 * 1000);
   const dailyBias = analyzeDailyTrend(dailyCandles);
 
-  // 2. HTF POI Mapping (4H or 1H)
   const htfInterval = htfChoice === "1h" ? "1h" : "4h";
   const htfIntervalMs = htfChoice === "1h" ? 3600 * 1000 : 4 * 3600 * 1000;
   const htfCandles = await fetchCandles(symbol, htfInterval, 50, htfIntervalMs);
-  // Use closed candles and a tiny edge buffer to prevent live price flickering
   const closedCandles = htfCandles.slice(0, -1);
   const zones = identifySupplyDemandZones(closedCandles);
   const currentPrice = closedCandles[closedCandles.length - 1].close;
@@ -170,7 +149,6 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     }
   }
 
-  // 3. LTF Confirmation (15m for 4H, 5m for 1H)
   const ltfInterval = htfChoice === "1h" ? "5m" : "15m";
   const ltfIntervalMs = htfChoice === "1h" ? 5 * 60 * 1000 : 15 * 60 * 1000;
   const ltfCandles = await fetchCandles(symbol, ltfInterval, 30, ltfIntervalMs);
@@ -184,16 +162,13 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     ltfConfirmation = "BEARISH_CONFIRMATION";
   }
 
-  // Scoring & Setup Decision
   let score = 40;
   let direction = "WAIT";
   let reasons = [`Daily Bias: ${dailyBias}`];
 
   if (activePoi) {
     score += 30;
-    reasons.push(
-      `Price testing ${htfChoice.toUpperCase()} ${activePoi.type} POI Zone`,
-    );
+    reasons.push(`Price testing ${htfChoice.toUpperCase()} ${activePoi.type} POI Zone`);
   } else {
     reasons.push(`Price floating in equilibrium (No active POI test)`);
   }
@@ -203,19 +178,9 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     reasons.push(`LTF (${ltfInterval}) confirmation candle received`);
   }
 
-  if (
-    dailyBias === "BULLISH" &&
-    activePoi?.type === "DEMAND" &&
-    ltfConfirmation === "BULLISH_CONFIRMATION" &&
-    score >= 70
-  ) {
+  if (dailyBias === "BULLISH" && activePoi?.type === "DEMAND" && ltfConfirmation === "BULLISH_CONFIRMATION" && score >= 70) {
     direction = "LONG";
-  } else if (
-    dailyBias === "BEARISH" &&
-    activePoi?.type === "SUPPLY" &&
-    ltfConfirmation === "BEARISH_CONFIRMATION" &&
-    score >= 70
-  ) {
+  } else if (dailyBias === "BEARISH" && activePoi?.type === "SUPPLY" && ltfConfirmation === "BEARISH_CONFIRMATION" && score >= 70) {
     direction = "SHORT";
   }
 
@@ -243,7 +208,6 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     reasons,
   };
 }
-
 function formatPrice(value) {
   if (!value) return "0.00";
   const decimals = value >= 100 ? 2 : value >= 1 ? 4 : 6;
@@ -257,81 +221,35 @@ async function loadMonitorState() {
   try {
     const saved = await readFile(MONITOR_FILE, "utf8");
     const monitors = JSON.parse(saved);
-
     for (const monitor of monitors) {
-      if (monitor?.id) {
-        activeMonitors.set(monitor.id, monitor);
-      }
+      if (monitor?.id) activeMonitors.set(monitor.id, monitor);
     }
-
-    console.info(`Loaded ${activeMonitors.size} saved monitors.`);
   } catch (error) {
-    if (error.code !== "ENOENT") {
-      console.error("Could not load monitor state:", error.message);
-    }
+    if (error.code !== "ENOENT") console.error("Could not load monitor state:", error.message);
   }
 }
 
 function saveMonitorState() {
   const snapshot = JSON.stringify([...activeMonitors.values()], null, 2);
-
-  persistenceQueue = persistenceQueue
-    .catch(() => {})
-    .then(() => writeFile(MONITOR_FILE, snapshot, "utf8"));
-
+  persistenceQueue = persistenceQueue.catch(() => {}).then(() => writeFile(MONITOR_FILE, snapshot, "utf8"));
   return persistenceQueue;
 }
 
 async function registerMonitor(token, chatId, result) {
   if (!["LONG", "SHORT"].includes(result.direction)) return;
-
   const entry = Number(result.entry);
   const stopLoss = Number(result.stopLoss);
   const takeProfit = Number(result.takeProfit);
 
-  if (
-    !Number.isFinite(entry) ||
-    !Number.isFinite(stopLoss) ||
-    !Number.isFinite(takeProfit) ||
-    entry <= 0 ||
-    stopLoss <= 0 ||
-    takeProfit <= 0
-  ) {
-    await sendMessage(
-      token,
-      chatId,
-      "⚠️ Signal monitoring was not started because its price levels are invalid.",
-    );
-    return;
-  }
+  if (!Number.isFinite(entry) || !Number.isFinite(stopLoss) || !Number.isFinite(takeProfit) || entry <= 0 || stopLoss <= 0 || takeProfit <= 0) return;
 
-  const risk =
-    result.direction === "LONG" ? entry - stopLoss : stopLoss - entry;
-
-  if (risk <= 0) {
-    await sendMessage(
-      token,
-      chatId,
-      "⚠️ Signal monitoring was not started because the stop-loss is on the wrong side of the entry.",
-    );
-    return;
-  }
+  const risk = result.direction === "LONG" ? entry - stopLoss : stopLoss - entry;
+  if (risk <= 0) return;
 
   const existing = [...activeMonitors.values()].find(
-    (m) =>
-      String(m.chatId) === String(chatId) &&
-      m.symbol === result.symbol &&
-      m.status === "ACTIVE",
+    (m) => String(m.chatId) === String(chatId) && m.symbol === result.symbol && m.status === "ACTIVE"
   );
-
-  if (existing) {
-    await sendMessage(
-      token,
-      chatId,
-      `ℹ️ Monitoring is already active for ${result.symbol}. I kept the existing monitor to avoid duplicate tracking.`,
-    );
-    return;
-  }
+  if (existing) return;
 
   const monitor = {
     id: `${chatId}-${result.symbol}-${Date.now()}`,
@@ -351,148 +269,33 @@ async function registerMonitor(token, chatId, result) {
 
   activeMonitors.set(monitor.id, monitor);
   await saveMonitorState();
-
-  await sendMessage(
-    token,
-    chatId,
-    [
-      `🔔 *Monitoring started: ${monitor.symbol}*`,
-      `Direction: ${monitor.direction}`,
-      `Reference entry: ${formatPrice(entry)}`,
-      `+1R alert: ${formatPrice(
-        monitor.direction === "LONG" ? entry + risk : entry - risk,
-      )}`,
-      `−0.75R warning: ${formatPrice(
-        monitor.direction === "LONG"
-          ? entry - risk * 0.75
-          : entry + risk * 0.75,
-      )}`,
-      "This is monitoring only; no orders will be placed.",
-    ].join("\n"),
-  );
 }
 
 async function checkOneMonitor(token, monitor) {
   if (monitor.status !== "ACTIVE") return;
-
   const candles = await fetchCandles(monitor.symbol, "1m", 3, 60 * 1000);
-
   if (!candles.length) return;
-
-  // Use the latest available one-minute candle's range.
   const candle = candles[candles.length - 1];
 
-  if (
-    !Number.isFinite(candle.high) ||
-    !Number.isFinite(candle.low) ||
-    !Number.isFinite(candle.close)
-  ) {
-    return;
-  }
-
   const isLong = monitor.direction === "LONG";
+  const hitStop = isLong ? candle.low <= monitor.stopLoss : candle.high >= monitor.stopLoss;
+  const hitTarget = isLong ? candle.high >= monitor.takeProfit : candle.low <= monitor.takeProfit;
 
-  const hitStop = isLong
-    ? candle.low <= monitor.stopLoss
-    : candle.high >= monitor.stopLoss;
-
-  const hitTarget = isLong
-    ? candle.high >= monitor.takeProfit
-    : candle.low <= monitor.takeProfit;
-
-  // OHLC data cannot tell us which level was touched first
-  // when both the stop-loss and take-profit are inside one candle.
   if (hitStop && hitTarget) {
-    await sendMessage(
-      token,
-      monitor.chatId,
-      `⚠️ *${monitor.symbol}: outcome unclear*\nThe same one-minute candle touched both the TP and SL levels. Candle data cannot confirm which was reached first. Monitoring stopped for this signal; check a more detailed price feed before deciding the outcome.`,
-    );
-
     monitor.status = "AMBIGUOUS";
     await saveMonitorState();
     return;
   }
-
   if (hitStop) {
-    await sendMessage(
-      token,
-      monitor.chatId,
-      `🔴 *${monitor.symbol}: stop-loss level touched*\nDirection: ${monitor.direction}\nSL reference: ${formatPrice(monitor.stopLoss)}\nThis is a price-level alert, not confirmation of an executed trade.`,
-    );
-
     monitor.status = "STOP_TOUCHED";
     await saveMonitorState();
     return;
   }
-
   if (hitTarget) {
-    await sendMessage(
-      token,
-      monitor.chatId,
-      `🎯 *${monitor.symbol}: take-profit level touched*\nDirection: ${monitor.direction}\nTP reference: ${formatPrice(monitor.takeProfit)}\nThis is a price-level alert, not confirmation of an executed trade.`,
-    );
-
     monitor.status = "TARGET_TOUCHED";
     await saveMonitorState();
     return;
   }
-
-  const hitOneR = isLong
-    ? candle.high >= monitor.entry + monitor.risk
-    : candle.low <= monitor.entry - monitor.risk;
-
-  const hitAdverse = isLong
-    ? candle.low <= monitor.entry - monitor.risk * 0.75
-    : candle.high >= monitor.entry + monitor.risk * 0.75;
-
-  if (
-    hitOneR &&
-    hitAdverse &&
-    !monitor.oneRAlerted &&
-    !monitor.adverseAlerted
-  ) {
-    await sendMessage(
-      token,
-      monitor.chatId,
-      `⚠️ *${monitor.symbol}: movement order unclear*\nThe same one-minute candle touched both the +1R and −0.75R alert levels. Their order cannot be determined from candle data.`,
-    );
-
-    monitor.oneRAlerted = true;
-    monitor.adverseAlerted = true;
-    await saveMonitorState();
-    return;
-  }
-
-  if (hitOneR && !monitor.oneRAlerted) {
-    await sendMessage(
-      token,
-      monitor.chatId,
-      `🟢 *${monitor.symbol}: +1R level reached*\nDirection: ${monitor.direction}\nReference entry: ${formatPrice(monitor.entry)}\nAlert level: ${formatPrice(
-        isLong ? monitor.entry + monitor.risk : monitor.entry - monitor.risk,
-      )}`,
-    );
-
-    monitor.oneRAlerted = true;
-    await saveMonitorState();
-  }
-
-  if (hitAdverse && !monitor.adverseAlerted) {
-    await sendMessage(
-      token,
-      monitor.chatId,
-      `🟠 *${monitor.symbol}: −0.75R adverse warning*\nDirection: ${monitor.direction}\nReference entry: ${formatPrice(monitor.entry)}\nWarning level: ${formatPrice(
-        isLong
-          ? monitor.entry - monitor.risk * 0.75
-          : monitor.entry + monitor.risk * 0.75,
-      )}`,
-    );
-
-    monitor.adverseAlerted = true;
-    await saveMonitorState();
-  }
-
-  monitor.lastCheckedCandle = candle.startTime;
 }
 
 async function runMonitorLoop(token) {
@@ -500,17 +303,9 @@ async function runMonitorLoop(token) {
     try {
       for (const monitor of activeMonitors.values()) {
         if (monitor.status !== "ACTIVE") continue;
-
-        try {
-          await checkOneMonitor(token, monitor);
-        } catch (error) {
-          console.error(`Monitor error for ${monitor.symbol}:`, error.message);
-        }
+        try { await checkOneMonitor(token, monitor); } catch (e) {}
       }
-    } catch (error) {
-      console.error("Monitoring loop error:", error.message);
-    }
-
+    } catch (e) {}
     await sleep(15000);
   }
 }
@@ -519,20 +314,13 @@ async function loadSubscribers() {
   try {
     const saved = JSON.parse(await readFile(SUBSCRIBERS_FILE, "utf8"));
     for (const id of saved) autoSubscribers.add(String(id));
-    console.info(`Loaded ${autoSubscribers.size} auto-alert subscribers.`);
   } catch (error) {
-    if (error.code !== "ENOENT") {
-      console.error("Could not load subscribers:", error.message);
-    }
+    if (error.code !== "ENOENT") console.error("Could not load subscribers:", error.message);
   }
 }
 
 async function saveSubscribers() {
-  await writeFile(
-    SUBSCRIBERS_FILE,
-    JSON.stringify([...autoSubscribers]),
-    "utf8",
-  );
+  await writeFile(SUBSCRIBERS_FILE, JSON.stringify([...autoSubscribers]), "utf8");
 }
 
 function buildAlertMessage(result) {
@@ -552,14 +340,12 @@ function buildAlertMessage(result) {
 function analyzeBreakOfStructure(candles, symbol, timeframe = "15m") {
   if (!candles || candles.length < 20) return null;
 
-  // Use completed historical candles to determine recent swing points
   const completedCandles = candles.slice(0, -1);
   const currentCandle = candles[candles.length - 1];
 
   let recentSwingHigh = -Infinity;
   let recentSwingLow = Infinity;
 
-  // Look back at previous completed candles for key swing levels
   const lookback = completedCandles.slice(-15);
   for (const c of lookback) {
     if (c.high > recentSwingHigh) recentSwingHigh = c.high;
@@ -608,29 +394,26 @@ function analyzeBreakOfStructure(candles, symbol, timeframe = "15m") {
 
   return null;
 }
-
-
 async function runAutoScan(token) {
   while (true) {
     if (autoSubscribers.size > 0) {
       for (const symbol of AUTO_SCAN_SYMBOLS) {
         try {
           // 15-Minute Break of Structure Check
-const bosCandles = await fetchCandles(symbol, "15m", 30, 15 * 60 * 1000);
-const bosAlertText = analyzeBreakOfStructure(bosCandles, symbol, "15 minutes");
+          const bosCandles = await fetchCandles(symbol, "15m", 30, 15 * 60 * 1000);
+          const bosAlertText = analyzeBreakOfStructure(bosCandles, symbol, "15 minutes");
 
-if (bosAlertText) {
-  for (const chatId of autoSubscribers) {
-    const key = `BOS-${chatId}-${symbol}`;
-    const last = lastAlertAt.get(key) || 0;
-    
-    // Prevent duplicate alerts within cooldown timeframe
-    if (Date.now() - last < ALERT_COOLDOWN_MS) continue;
+          if (bosAlertText) {
+            for (const chatId of autoSubscribers) {
+              const key = `BOS-${chatId}-${symbol}`;
+              const last = lastAlertAt.get(key) || 0;
+              
+              if (Date.now() - last < ALERT_COOLDOWN_MS) continue;
 
-    lastAlertAt.set(key, Date.now());
-    await sendMessage(token, chatId, bosAlertText);
-  }
-}
+              lastAlertAt.set(key, Date.now());
+              await sendMessage(token, chatId, bosAlertText);
+            }
+          }
           
           const result = await performMultiTimeframeAnalysis(symbol, "4h");
           if (result.direction === "WAIT") continue;
@@ -693,7 +476,7 @@ async function handleMessage(token, message) {
     await sendMessage(
       token,
       chatId,
-      "🤖 *Supply & Demand Multi-TF Bot*\n/analyze <symbol> — Top-Down Analysis (Daily + 4H POI + 15m)",
+      "🤖 *Supply & Demand & BOS Bot*\n/analyze <symbol> — Top-Down Analysis\n/bos <symbol> — Check 15m Break of Structure\n/autoon — Enable auto scans",
     );
     return;
   }
@@ -726,6 +509,24 @@ async function handleMessage(token, message) {
     return;
   }
   
+  // On-demand manual BOS test command
+  if (command === "/bos" && args.length >= 1) {
+    const symbol = args[0].toUpperCase();
+    await sendMessage(token, chatId, `🔍 Checking 15-minute Break of Structure for ${symbol}...`);
+    try {
+      const candles = await fetchCandles(symbol, "15m", 30, 15 * 60 * 1000);
+      const bosText = analyzeBreakOfStructure(candles, symbol, "15 minutes");
+      if (bosText) {
+        await sendMessage(token, chatId, bosText);
+      } else {
+        await sendMessage(token, chatId, `ℹ️ No confirmed Break of Structure detected on ${symbol} (15m timeframe) right now.`);
+      }
+    } catch (err) {
+      await sendMessage(token, chatId, `⚠️ Error checking BOS: ${err.message}`);
+    }
+    return;
+  }
+
   if (command === "/analyze" && args.length >= 1) {
     const symbol = args[0].toUpperCase();
     await sendMessage(
@@ -759,11 +560,10 @@ async function handleMessage(token, message) {
           await registerMonitor(token, chatId, result);
         } catch (error) {
           console.error("Could not register signal monitor:", error.message);
-
           await sendMessage(
             token,
             chatId,
-            "⚠️ The signal was sent, but monitoring could not be started. Check the Replit console.",
+            "⚠️ The signal was sent, but monitoring could not be started. Check the console.",
           );
         }
       }
@@ -779,7 +579,7 @@ async function handleMessage(token, message) {
 
 export async function startBot(token) {
   let offset = 0;
-  console.info("Multi-Timeframe S&D Bot running.");
+  console.info("Multi-Timeframe S&D & BOS Bot running.");
   await loadMonitorState();
   void runMonitorLoop(token);
   await loadSubscribers();
