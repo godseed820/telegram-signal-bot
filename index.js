@@ -550,11 +550,89 @@ function buildAlertMessage(result) {
   ].join("\n");
 }
 
+function analyzeBreakOfStructure(candles, symbol, timeframe = "15m") {
+  if (!candles || candles.length < 20) return null;
+
+  // Use completed historical candles to determine recent swing points
+  const completedCandles = candles.slice(0, -1);
+  const currentCandle = candles[candles.length - 1];
+
+  let recentSwingHigh = -Infinity;
+  let recentSwingLow = Infinity;
+
+  // Look back at previous completed candles for key swing levels
+  const lookback = completedCandles.slice(-15);
+  for (const c of lookback) {
+    if (c.high > recentSwingHigh) recentSwingHigh = c.high;
+    if (c.low < recentSwingLow) recentSwingLow = c.low;
+  }
+
+  const currentBody = Math.abs(currentCandle.close - currentCandle.open);
+  const currentRange = currentCandle.high - currentCandle.low;
+  const isDisplacement = currentRange > 0 && (currentBody / currentRange) >= 0.55;
+
+  // 1. BULLISH BOS CHECK
+  if (currentCandle.close > recentSwingHigh) {
+    return [
+      `🚨 *BREAK OF STRUCTURE (BOS)*`,
+      `Pair: ${symbol}`,
+      `Timeframe: ${timeframe}`,
+      `Broken swing high: ${formatPrice(recentSwingHigh)}`,
+      `Candle close: ${formatPrice(currentCandle.close)}`,
+      `Displacement: ${isDisplacement ? "Confirmed" : "Weak"}`,
+      `Wick-only break: Rejected`,
+      `Reasons for confirmation`,
+      `• Completed candle closed above the previous confirmed swing high.`,
+      `• Candle body met the displacement threshold.`,
+      `• Break passed the balanced confirmation rules.`,
+      `Result: Potential bullish structure continuation. Wait for your entry setup; BOS alone is not an automatic buy signal.`
+    ].join("\n");
+  }
+
+  // 2. BEARISH BOS CHECK
+  if (currentCandle.close < recentSwingLow) {
+    return [
+      `🚨 *BREAK OF STRUCTURE (BOS)*`,
+      `Pair: ${symbol}`,
+      `Timeframe: ${timeframe}`,
+      `Broken swing low: ${formatPrice(recentSwingLow)}`,
+      `Candle close: ${formatPrice(currentCandle.close)}`,
+      `Displacement: ${isDisplacement ? "Confirmed" : "Weak"}`,
+      `Wick-only break: Rejected`,
+      `Reasons for confirmation`,
+      `• Completed candle closed below the previous confirmed swing low.`,
+      `• Candle body met the displacement threshold.`,
+      `• Break passed the balanced confirmation rules.`,
+      `Result: Potential bearish structure continuation. Wait for your entry setup; BOS alone is not an automatic sell signal.`
+    ].join("\n");
+  }
+
+  return null;
+}
+
+
 async function runAutoScan(token) {
   while (true) {
     if (autoSubscribers.size > 0) {
       for (const symbol of AUTO_SCAN_SYMBOLS) {
         try {
+          // 15-Minute Break of Structure Check
+const bosCandles = await fetchCandles(symbol, "15m", 30, 15 * 60 * 1000);
+const bosAlertText = analyzeBreakOfStructure(bosCandles, symbol, "15 minutes");
+
+if (bosAlertText) {
+  for (const chatId of autoSubscribers) {
+    const key = `BOS-${chatId}-${symbol}`;
+    const last = lastAlertAt.get(key) || 0;
+    
+    // Prevent duplicate alerts within cooldown timeframe
+    if (Date.now() - last < ALERT_COOLDOWN_MS) continue;
+
+    lastAlertAt.set(key, Date.now());
+    await sendMessage(token, chatId, bosAlertText);
+  }
+}
+          
           const result = await performMultiTimeframeAnalysis(symbol, "4h");
           if (result.direction === "WAIT") continue;
 
