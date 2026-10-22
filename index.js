@@ -1,8 +1,11 @@
 import { pathToFileURL } from "node:url";
+import { createHmac } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 const TELEGRAM_API = "https://api.telegram.org";
 const KRAKEN_CHARTS_API = "https://futures.kraken.com/api/charts/v1";
+const BYBIT_DEMO_API = "https://api-demo.bybit.com";
+const BYBIT_RECV_WINDOW = "5000";
 const MIN_PUBLIC_REQUEST_INTERVAL_MS = 500;
 const MONITOR_FILE = resolve(process.cwd(), "trade-monitors.json");
 const activeMonitors = new Map();
@@ -15,6 +18,80 @@ const ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000;
 const SUBSCRIBERS_FILE = resolve(process.cwd(), "auto-subscribers.json");
 const autoSubscribers = new Set();
 const lastAlertAt = new Map();
+
+
+async function getBybitDemoStatus() {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+
+  if (process.env.BYBIT_DEMO_TRADING !== "true") {
+    return {
+      ok: false,
+      message: "Demo mode is not enabled. Set BYBIT_DEMO_TRADING=true in FadeHost."
+    };
+  }
+
+  if (!apiKey || !apiSecret) {
+    return {
+      ok: false,
+      message: "Missing BYBIT_API_KEY or BYBIT_API_SECRET in FadeHost."
+    };
+  }
+
+  const timestamp = Date.now().toString();
+  const query = "accountType=UNIFIED&coin=USDT";
+  const signaturePayload =
+    timestamp + apiKey + BYBIT_RECV_WINDOW + query;
+
+  const signature = createHmac("sha256", apiSecret)
+    .update(signaturePayload)
+    .digest("hex");
+
+  try {
+    const response = await fetch(
+      `${BYBIT_DEMO_API}/v5/account/wallet-balance?${query}`,
+      {
+        method: "GET",
+        headers: {
+          "X-BAPI-API-KEY": apiKey,
+          "X-BAPI-TIMESTAMP": timestamp,
+          "X-BAPI-RECV-WINDOW": BYBIT_RECV_WINDOW,
+          "X-BAPI-SIGN": signature
+        },
+        signal: AbortSignal.timeout(10000)
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || data.retCode !== 0) {
+      return {
+        ok: false,
+        message: `Bybit error ${data.retCode ?? response.status}: ${
+          data.retMsg ?? response.statusText
+        }`
+      };
+    }
+
+    const account = data.result?.list?.[0];
+    const usdt = account?.coin?.find(
+      coin => coin.coin === "USDT"
+    );
+
+    return {
+      ok: true,
+      accountType: account?.accountType ?? "Unknown",
+      walletBalance: usdt?.walletBalance ?? "0",
+      message: "Connected to Bybit Demo successfully."
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      message: `Connection failed: ${error.message}`
+    };
+  }
+}
+
 
 const KRAKEN_MARKETS = Object.freeze({
   BTCUSDT: Object.freeze({ contract: "PF_XBTUSD", pair: "BTC:USD" }),
@@ -476,8 +553,7 @@ async function handleMessage(token, message) {
     await sendMessage(
       token,
       chatId,
-      "🤖 *Supply & Demand & BOS Bot*\n/analyze <symbol> — Top-Down Analysis\n/bos <symbol> — Check 15m Break of Structure\n/autoon — Enable auto scans",
-    );
+            "🤖 *Supply & Demand & BOS Bot*\n/analyze <symbol> — Top-Down Analysis\n/bos <symbol> — Check 15m Break of Structure\n/autoon — Enable auto scans\n/autooff — Disable auto scans\n/autostatus — Check auto scans\n/demostatus — Check Bybit Demo connection",
     return;
   }
 
@@ -508,6 +584,34 @@ async function handleMessage(token, message) {
     );
     return;
   }
+
+  
+  if (command === "/demostatus") {
+    await sendMessage(
+      token,
+      chatId,
+      "🔎 Checking Bybit Demo connection... No orders will be placed."
+    );
+
+    const status = await getBybitDemoStatus();
+
+    if (!status.ok) {
+      await sendMessage(
+        token,
+        chatId,
+        `❌ Bybit Demo check failed:\n${status.message}`
+      );
+      return;
+    }
+
+    await sendMessage(
+      token,
+      chatId,
+      `✅ ${status.message}\nAccount: ${status.accountType}\nUSDT wallet balance: ${status.walletBalance}\n\n🔒 Read-only check. No trades placed.`
+    );
+    return;
+  }
+  
   
   // On-demand manual BOS test command
   if (command === "/bos" && args.length >= 1) {
