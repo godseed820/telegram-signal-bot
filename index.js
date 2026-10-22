@@ -305,60 +305,81 @@ function analyzeDailyTrend(dailyCandles) {
   return "CONSOLIDATION";
 }
 
-export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
-  const market = await getKrakenMarket(symbol);
 
-  const dailyCandles = await fetchCandles(symbol, "1d", 14, 24 * 60 * 60 * 1000);
-  const dailyBias = analyzeDailyTrend(dailyCandles);
+export async function performMultiTimeframeAnalysis(symbol) {
+  const normalized = symbol?.trim().toUpperCase();
 
-  const htfInterval = htfChoice === "1h" ? "1h" : "4h";
-  const htfIntervalMs = htfChoice === "1h" ? 3600 * 1000 : 4 * 3600 * 1000;
-  const htfCandles = await fetchCandles(symbol, htfInterval, 50, htfIntervalMs);
-  const closedCandles = htfCandles.slice(0, -1);
-  const zones = identifySupplyDemandZones(closedCandles);
-  const currentPrice = closedCandles[closedCandles.length - 1].close;
+  if (!BYBIT_ALLOWED_SYMBOLS.has(normalized)) {
+    throw new Error("Unsupported scalping symbol.");
+  }
+
+  const intervalMs15m = 15 * 60 * 1000;
+  const intervalMs5m = 5 * 60 * 1000;
+
+  const [contextRaw, entryRaw] = await Promise.all([
+    fetchBybitCandles(normalized, "15m", 100, intervalMs15m),
+    fetchBybitCandles(normalized, "5m", 100, intervalMs5m),
+  ]);
+
+  const now = Date.now();
+
+  const contextCandles = contextRaw.filter(
+    (candle) => candle.closeTime <= now
+  );
+  const entryCandles = entryRaw.filter(
+    (candle) => candle.closeTime <= now
+  );
+
+  if (contextCandles.length < 20 || entryCandles.length < 20) {
+    throw new Error("Not enough completed Bybit candles.");
+  }
+
+  const currentPrice = entryCandles[entryCandles.length - 1].close;
+  const zones = identifySupplyDemandZones(contextCandles);
 
   let activePoi = null;
-  for (const zone of zones) {
-    if (currentPrice >= zone.low * 0.999 && currentPrice <= zone.high * 1.001) {
+
+  for (const zone of zones.slice().reverse()) {
+    if (
+      currentPrice >= zone.low * 0.999 &&
+      currentPrice <= zone.high * 1.001
+    ) {
       activePoi = zone;
       break;
     }
   }
 
-  const ltfInterval = htfChoice === "1h" ? "5m" : "15m";
-  const ltfIntervalMs = htfChoice === "1h" ? 5 * 60 * 1000 : 15 * 60 * 1000;
-  const ltfCandles = await fetchCandles(symbol, ltfInterval, 30, ltfIntervalMs);
-  const lastLtf = ltfCandles[ltfCandles.length - 2];
-  const prevLtf = ltfCandles[ltfCandles.length - 3];
+  const last = entryCandles[entryCandles.length - 1];
+  const previous = entryCandles[entryCandles.length - 2];
 
-  let ltfConfirmation = "NONE";
-  if (activePoi?.type === "DEMAND" && lastLtf.close > prevLtf.high) {
-    ltfConfirmation = "BULLISH_CONFIRMATION";
-  } else if (activePoi?.type === "SUPPLY" && lastLtf.close < prevLtf.low) {
-    ltfConfirmation = "BEARISH_CONFIRMATION";
-  }
+  const bullishBos = last.close > previous.high;
+  const bearishBos = last.close < previous.low;
 
-  let score = 40;
   let direction = "WAIT";
-  let reasons = [`Daily Bias: ${dailyBias}`];
+  let score = 40;
+  const reasons = [
+    "Market data: Bybit Demo public candles",
+    "Context: completed 15m candles",
+    "Entry confirmation: completed 5m candles",
+  ];
 
-  if (activePoi) {
-    score += 30;
-    reasons.push(`Price testing ${htfChoice.toUpperCase()} ${activePoi.type} POI Zone`);
+  if (!activePoi) {
+    reasons.push("No active 15m supply/demand zone at current price.");
   } else {
-    reasons.push(`Price floating in equilibrium (No active POI test)`);
+    score += 20;
+    reasons.push(`Price testing 15m ${activePoi.type} zone.`);
   }
 
-  if (ltfConfirmation !== "NONE") {
-    score += 30;
-    reasons.push(`LTF (${ltfInterval}) confirmation candle received`);
-  }
-
-  if (dailyBias === "BULLISH" && activePoi?.type === "DEMAND" && ltfConfirmation === "BULLISH_CONFIRMATION" && score >= 70) {
+  if (activePoi?.type === "DEMAND" && bullishBos) {
     direction = "LONG";
-  } else if (dailyBias === "BEARISH" && activePoi?.type === "SUPPLY" && ltfConfirmation === "BEARISH_CONFIRMATION" && score >= 70) {
+    score += 30;
+    reasons.push("Bullish 5m candle breakout detected.");
+  } else if (activePoi?.type === "SUPPLY" && bearishBos) {
     direction = "SHORT";
+    score += 30;
+    reasons.push("Bearish 5m candle breakout detected.");
+  } else {
+    reasons.push("No matching 5m confirmation; waiting.");
   }
 
   let entry = currentPrice;
@@ -368,15 +389,25 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
   if (direction === "LONG" && activePoi) {
     stopLoss = activePoi.low * 0.998;
     const risk = entry - stopLoss;
-    takeProfit = entry + risk * 2.5;
+
+    if (risk > 0) {
+      takeProfit = entry + risk * 2;
+    } else {
+      direction = "WAIT";
+    }
   } else if (direction === "SHORT" && activePoi) {
     stopLoss = activePoi.high * 1.002;
     const risk = stopLoss - entry;
-    takeProfit = entry - risk * 2.5;
+
+    if (risk > 0) {
+      takeProfit = entry - risk * 2;
+    } else {
+      direction = "WAIT";
+    }
   }
 
   return {
-    symbol: market.commandSymbol,
+    symbol: normalized,
     direction,
     score,
     entry,
@@ -385,6 +416,7 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     reasons,
   };
 }
+
 function formatPrice(value) {
   if (!value) return "0.00";
   const decimals = value >= 100 ? 2 : value >= 1 ? 4 : 6;
