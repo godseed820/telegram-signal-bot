@@ -686,6 +686,57 @@ async function handleMessage(token, message) {
   }
 
   
+  if (command === "/bybitcheck") {
+    await sendMessage(
+      token,
+      chatId,
+      "🔎 Testing Bybit Demo market candles..."
+    );
+
+    const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
+    const results = [];
+
+    for (const symbol of symbols) {
+      try {
+        const candles = await fetchBybitCandles(
+          symbol,
+          "15m",
+          10,
+          15 * 60 * 1000
+        );
+
+        const completed = candles.filter(
+          (candle) => candle.closeTime <= Date.now()
+        );
+
+        if (completed.length < 2) {
+          throw new Error("Not enough completed candles.");
+        }
+
+        const last = completed[completed.length - 1];
+
+        results.push(
+          `✅ ${symbol}: OK\n` +
+          `Last completed 15m close: ${last.close}`
+        );
+      } catch (error) {
+        results.push(
+          `❌ ${symbol}: ${error.message}`
+        );
+      }
+    }
+
+    await sendMessage(
+      token,
+      chatId,
+      "📊 Bybit Market Data Test\n\n" +
+      results.join("\n\n") +
+      "\n\n🔒 Public market data only. No orders placed."
+    );
+
+    return;
+  }
+  
   if (command === "/demostatus") {
     await sendMessage(
       token,
