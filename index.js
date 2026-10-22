@@ -546,6 +546,163 @@ function buildAlertMessage(result) {
   ].join("\n");
 }
 
+
+export function detectBreakOfStructure(candles, options = {}) {
+  const pivotStrength = options.pivotStrength ?? 3;
+  const atrPeriod = options.atrPeriod ?? 14;
+  const displacementAtr = options.displacementAtr ?? 0.6;
+
+  if (
+    !Array.isArray(candles) ||
+    !Number.isInteger(pivotStrength) ||
+    pivotStrength < 1 ||
+    !Number.isInteger(atrPeriod) ||
+    atrPeriod < 1 ||
+    !Number.isFinite(displacementAtr) ||
+    displacementAtr < 0 ||
+    candles.length < Math.max(atrPeriod + 2, pivotStrength * 2 + 5)
+  ) {
+    return {
+      direction: "NONE",
+      reason: "Not enough valid candles or invalid detector settings."
+    };
+  }
+
+  const valid = candles.every(c =>
+    Number.isFinite(c.open) &&
+    Number.isFinite(c.high) &&
+    Number.isFinite(c.low) &&
+    Number.isFinite(c.close) &&
+    c.high >= Math.max(c.open, c.close, c.low) &&
+    c.low <= Math.min(c.open, c.close, c.high)
+  );
+
+  if (!valid) {
+    return {
+      direction: "NONE",
+      reason: "Invalid candle data."
+    };
+  }
+
+  // The caller must supply completed candles only.
+  const last = candles[candles.length - 1];
+
+  const trueRanges = candles.slice(1).map((c, i) =>
+    Math.max(
+      c.high - c.low,
+      Math.abs(c.high - candles[i].close),
+      Math.abs(c.low - candles[i].close)
+    )
+  );
+
+  const recentTR = trueRanges.slice(-atrPeriod);
+  const atr = recentTR.reduce((sum, v) => sum + v, 0) / recentTR.length;
+  const body = Math.abs(last.close - last.open);
+
+  if (!(atr > 0)) {
+    return { direction: "NONE", reason: "ATR is zero or invalid." };
+  }
+
+  let swingHigh = null;
+  let swingLow = null;
+
+  // Leave the newest candle as the breakout candidate.
+  const lastPivotIndex = candles.length - pivotStrength - 2;
+
+  for (let i = lastPivotIndex; i >= pivotStrength; i--) {
+    const candidate = candles[i];
+    let isHigh = true;
+    let isLow = true;
+
+    for (let j = i - pivotStrength; j <= i + pivotStrength; j++) {
+      if (j === i) continue;
+
+      if (candles[j].high >= candidate.high) isHigh = false;
+      if (candles[j].low <= candidate.low) isLow = false;
+    }
+
+    if (isHigh && !swingHigh) {
+      const brokenEarlier = candles
+        .slice(i + pivotStrength + 1, candles.length - 1)
+        .some(c => c.close > candidate.high);
+
+      if (!brokenEarlier) {
+        swingHigh = { index: i, level: candidate.high };
+      }
+    }
+
+    if (isLow && !swingLow) {
+      const brokenEarlier = candles
+        .slice(i + pivotStrength + 1, candles.length - 1)
+        .some(c => c.close < candidate.low);
+
+      if (!brokenEarlier) {
+        swingLow = { index: i, level: candidate.low };
+      }
+    }
+
+    if (swingHigh && swingLow) break;
+  }
+
+  const bullishBreak = swingHigh && last.close > swingHigh.level;
+  const bearishBreak = swingLow && last.close < swingLow.level;
+
+  if (bullishBreak && bearishBreak) {
+    return {
+      direction: "NONE",
+      reason: "Conflicting structure breaks."
+    };
+  }
+
+  if (!bullishBreak && !bearishBreak) {
+    const sweptHigh = swingHigh &&
+      last.high > swingHigh.level &&
+      last.close <= swingHigh.level;
+
+    const sweptLow = swingLow &&
+      last.low < swingLow.level &&
+      last.close >= swingLow.level;
+
+    return {
+      direction: "NONE",
+      reason: sweptHigh || sweptLow
+        ? "Wick sweep without candle-close confirmation."
+        : "No confirmed swing break."
+    };
+  }
+
+  if (body < atr * displacementAtr) {
+    return {
+      direction: "NONE",
+      reason: "Breakout lacks sufficient ATR displacement."
+    };
+  }
+
+  if (bullishBreak && last.close <= last.open) {
+    return {
+      direction: "NONE",
+      reason: "Bullish BOS requires a bullish candle."
+    };
+  }
+
+  if (bearishBreak && last.close >= last.open) {
+    return {
+      direction: "NONE",
+      reason: "Bearish BOS requires a bearish candle."
+    };
+  }
+
+  const bullish = Boolean(bullishBreak);
+
+  return {
+    direction: bullish ? "BULLISH" : "BEARISH",
+    level: bullish ? swingHigh.level : swingLow.level,
+    candleTime: last.startTime ?? null,
+    reason: `Confirmed ${bullish ? "bullish" : "bearish"} BOS: close beyond swing with displacement.`
+  };
+}
+
+
 function analyzeBreakOfStructure(candles, symbol, timeframe = "15m") {
   if (!candles || candles.length < 20) return null;
 
