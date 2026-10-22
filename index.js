@@ -553,7 +553,7 @@ async function handleMessage(token, message) {
     await sendMessage(
       token,
       chatId,
-            "🤖 *Supply & Demand & BOS Bot*\n/analyze <symbol> — Top-Down Analysis\n/bos <symbol> — Check 15m Break of Structure\n/autoon — Enable auto scans\n/autooff — Disable auto scans\n/autostatus — Check auto scans\n/demostatus — Check Bybit Demo connection",
+            "🤖 *Supply & Demand & BOS Bot*\n/analyze <symbol> — Top-Down Analysis\n/bos <symbol> — Check 15m Break of Structure\n/autoon — Enable auto scans\n/autooff — Disable auto scans\n/autostatus — Check auto scans\n/demostatus — Check Bybit Demo connection",);
     return;
   }
 
