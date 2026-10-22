@@ -155,6 +155,106 @@ async function fetchCandles(symbol, interval, count, intervalMs) {
   return parseKrakenCandles(rawData, intervalMs);
 }
 
+
+const BYBIT_MARKET_API = "https://api-demo.bybit.com";
+const BYBIT_ALLOWED_SYMBOLS = new Set([
+  "BTCUSDT",
+  "ETHUSDT",
+  "SOLUSDT",
+]);
+
+function parseBybitCandles(payload, intervalMs) {
+  const rows = payload?.result?.list;
+
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error("Bybit returned no candle data.");
+  }
+
+  return rows
+    .map((row) => ({
+      startTime: Number(row[0]),
+      closeTime: Number(row[0]) + intervalMs,
+      open: Number(row[1]),
+      high: Number(row[2]),
+      low: Number(row[3]),
+      close: Number(row[4]),
+    }))
+    .filter((candle) =>
+      Number.isFinite(candle.startTime) &&
+      Number.isFinite(candle.open) &&
+      Number.isFinite(candle.high) &&
+      Number.isFinite(candle.low) &&
+      Number.isFinite(candle.close)
+    )
+    .sort((a, b) => a.startTime - b.startTime);
+}
+
+async function fetchBybitCandles(
+  symbol,
+  interval,
+  count,
+  intervalMs
+) {
+  const normalized = symbol?.trim().toUpperCase();
+
+  if (!BYBIT_ALLOWED_SYMBOLS.has(normalized)) {
+    throw new Error("Unsupported Bybit test symbol.");
+  }
+
+  const intervalMap = {
+    "1d": "D",
+    "4h": "240",
+    "1h": "60",
+    "15m": "15",
+    "5m": "5",
+  };
+
+  const bybitInterval = intervalMap[interval];
+
+  if (!bybitInterval) {
+    throw new Error("Unsupported Bybit candle interval.");
+  }
+
+  const url = new URL(
+    "/v5/market/kline",
+    BYBIT_MARKET_API
+  );
+
+  url.searchParams.set("category", "linear");
+  url.searchParams.set("symbol", normalized);
+  url.searchParams.set("interval", bybitInterval);
+  url.searchParams.set("limit", String(
+    Math.min(1000, Math.max(1, Math.floor(count)))
+  ));
+
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Bybit market-data HTTP error: ${response.status}`
+    );
+  }
+
+  const payload = await response.json();
+
+  if (payload.retCode !== 0) {
+    throw new Error(
+      `Bybit market-data error ${payload.retCode}: ${payload.retMsg}`
+    );
+  }
+
+  const candles = parseBybitCandles(payload, intervalMs);
+
+  if (candles.length < 3) {
+    throw new Error("Insufficient Bybit candle data.");
+  }
+
+  return candles;
+}
+
+
 function identifySupplyDemandZones(candles) {
   const zones = [];
   for (let i = 2; i < candles.length - 1; i++) {
