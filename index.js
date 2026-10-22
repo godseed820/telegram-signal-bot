@@ -954,22 +954,92 @@ async function handleMessage(token, message) {
   
   
   // On-demand manual BOS test command
-  if (command === "/bos" && args.length >= 1) {
-    const symbol = args[0].toUpperCase();
-    await sendMessage(token, chatId, `🔍 Checking 15-minute Break of Structure for ${symbol}...`);
-    try {
-      const candles = await fetchCandles(symbol, "15m", 30, 15 * 60 * 1000);
-      const bosText = analyzeBreakOfStructure(candles, symbol, "15 minutes");
-      if (bosText) {
-        await sendMessage(token, chatId, bosText);
-      } else {
-        await sendMessage(token, chatId, `ℹ️ No confirmed Break of Structure detected on ${symbol} (15m timeframe) right now.`);
-      }
-    } catch (err) {
-      await sendMessage(token, chatId, `⚠️ Error checking BOS: ${err.message}`);
-    }
+  
+if (text === "/bos" || text.startsWith("/bos ")) {
+  const symbolInput = text.split(/\s+/)[1] || "BTCUSDT";
+  const symbol = symbolInput.toUpperCase();
+
+  const allowedSymbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
+
+  if (!allowedSymbols.includes(symbol)) {
+    await bot.sendMessage(
+      chatId,
+      "Unsupported symbol. Use /bos BTCUSDT, /bos ETHUSDT, or /bos SOLUSDT."
+    );
     return;
   }
+
+  try {
+    await bot.sendMessage(
+      chatId,
+      `Checking confirmed 15m BOS for ${symbol}...`
+    );
+
+    // Use your existing candle-fetching function.
+    const candles = await fetchCandles(
+      symbol,
+      "15m",
+      100,
+      15 * 60 * 1000
+    );
+
+    if (!Array.isArray(candles) || candles.length < 25) {
+      await bot.sendMessage(
+        chatId,
+        `BOS check unavailable for ${symbol}: insufficient candle data.`
+      );
+      return;
+    }
+
+    // Exclude the latest candle if it is still forming.
+    const completedCandles = candles.slice(0, -1);
+
+    const result = detectBreakOfStructure(completedCandles, {
+      pivotStrength: 3,
+      atrPeriod: 14,
+      displacementAtr: 0.6
+    });
+
+    if (!result || result.direction === "NONE") {
+      await bot.sendMessage(
+        chatId,
+        `⚪ NO CONFIRMED BOS — ${symbol}\n` +
+        `Timeframe: 15m\n` +
+        `Reason: ${result?.reason || "No valid structure break."}`
+      );
+      return;
+    }
+
+    const direction =
+      result.direction === "BULLISH" ? "🟢 BULLISH BOS" : "🔴 BEARISH BOS";
+
+    const level = Number.isFinite(result.level)
+      ? result.level.toLocaleString("en-US", {
+          maximumFractionDigits: 8
+        })
+      : "Unavailable";
+
+    await bot.sendMessage(
+      chatId,
+      `${direction}\n` +
+      `Pair: ${symbol}\n` +
+      `Timeframe: 15m\n` +
+      `Broken swing level: ${level}\n` +
+      `Reason: ${result.reason}\n\n` +
+      `Signals only — no trade was placed.`
+    );
+  } catch (error) {
+    console.error(`/bos failed for ${symbol}:`, error);
+
+    await bot.sendMessage(
+      chatId,
+      `BOS check failed for ${symbol}. Candle data may be unavailable. Please try again later.`
+    );
+  }
+
+  return;
+      }
+  
 
   if (command === "/analyze" && args.length >= 1) {
     const symbol = args[0].toUpperCase();
