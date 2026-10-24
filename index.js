@@ -1137,24 +1137,6 @@ if (
   main().catch(console.error);
 }
 
-const TELEGRAM_API = "https://api.telegram.org";
-const KRAKEN_CHARTS_API = "https://futures.kraken.com/api/charts/v1";
-const BYBIT_DEMO_API = "https://api-demo.bybit.com";
-const BYBIT_RECV_WINDOW = "5000";
-const MIN_PUBLIC_REQUEST_INTERVAL_MS = 500;
-const MONITOR_FILE = resolve(process.cwd(), "trade-monitors.json");
-const activeMonitors = new Map();
-
-let persistenceQueue = Promise.resolve();
-let nextPublicRequestAt = 0;
-const AUTO_SCAN_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
-const AUTO_SCAN_INTERVAL_MS = 5 * 60 * 1000;
-const ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000;
-const SUBSCRIBERS_FILE = resolve(process.cwd(), "auto-subscribers.json");
-const autoSubscribers = new Set();
-const lastAlertAt = new Map();
-
-
 async function getBybitDemoStatus() {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
