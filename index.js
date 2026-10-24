@@ -1137,17 +1137,6 @@ if (
   main().catch(console.error);
 }
 
-async function getBybitDemoStatus() {
-  const apiKey = process.env.BYBIT_API_KEY;
-  const apiSecret = process.env.BYBIT_API_SECRET;
-
-  if (process.env.BYBIT_DEMO_TRADING !== "true") {
-    return {
-      ok: false,
-      message: "Demo mode is not enabled. Set BYBIT_DEMO_TRADING=true in FadeHost."
-    };
-  }
-
   if (!apiKey || !apiSecret) {
     return {
       ok: false,
