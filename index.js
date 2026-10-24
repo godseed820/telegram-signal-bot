@@ -1137,13 +1137,6 @@ if (
   main().catch(console.error);
 }
 
-  if (!apiKey || !apiSecret) {
-    return {
-      ok: false,
-      message: "Missing BYBIT_API_KEY or BYBIT_API_SECRET in FadeHost."
-    };
-  }
-
   const timestamp = Date.now().toString();
   const query = "accountType=UNIFIED&coin=USDT";
   const signaturePayload =
