@@ -1137,10 +1137,6 @@ if (
   main().catch(console.error);
 }
 
-
-import { createHmac } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
 const TELEGRAM_API = "https://api.telegram.org";
 const KRAKEN_CHARTS_API = "https://futures.kraken.com/api/charts/v1";
 const BYBIT_DEMO_API = "https://api-demo.bybit.com";
