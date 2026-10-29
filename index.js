@@ -19,6 +19,72 @@ const SUBSCRIBERS_FILE = resolve(process.cwd(), "auto-subscribers.json");
 const autoSubscribers = new Set();
 const lastAlertAt = new Map();
 
+// Per-chat preferences for the FXLens-style settings and mindset questionnaire.
+const USER_SETTINGS_FILE = resolve(process.cwd(), "user-settings.json");
+const userSettings = new Map();
+const MINDSET_HABITS = [
+  "FOMO entries",
+  "Revenge trading",
+  "Closing winners early",
+  "Holding losers too long",
+  "Oversizing when confident",
+  "Hesitating on A-setups",
+  "Overtrading slow days",
+];
+const AVAILABLE_STRATEGIES = ["S&D", "SMC", "BOS", "CRT", "BREAK-RETEST", "TRENDLINE"];
+const AVAILABLE_ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
+
+function defaultUserSettings() {
+  return {
+    strategies: ["S&D", "BOS", "CRT"],
+    assets: [...AVAILABLE_ASSETS],
+    contextTimeframe: "4h",
+    confirmationTimeframe: "15m",
+    entryTimeframe: "5m",
+    minRiskReward: 1,
+    mindset: [],
+  };
+}
+
+function getUserSettings(chatId) {
+  const key = String(chatId);
+  if (!userSettings.has(key)) userSettings.set(key, defaultUserSettings());
+  return userSettings.get(key);
+}
+
+async function loadUserSettings() {
+  try {
+    const saved = JSON.parse(await readFile(USER_SETTINGS_FILE, "utf8"));
+    for (const [chatId, settings] of Object.entries(saved)) {
+      userSettings.set(chatId, { ...defaultUserSettings(), ...settings });
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") console.error("Could not load user settings:", error.message);
+  }
+}
+
+let settingsSaveQueue = Promise.resolve();
+function saveUserSettings() {
+  const snapshot = Object.fromEntries(userSettings.entries());
+  settingsSaveQueue = settingsSaveQueue.catch(() => {}).then(() =>
+    writeFile(USER_SETTINGS_FILE, JSON.stringify(snapshot, null, 2), "utf8")
+  );
+  return settingsSaveQueue;
+}
+
+function settingsSummary(chatId) {
+  const s = getUserSettings(chatId);
+  return [
+    "⚙️ *Your settings*",
+    `Assets: ${s.assets.join(", ")}`,
+    `Strategies: ${s.strategies.join(", ")}`,
+    `Timeframes: context ${s.contextTimeframe} → confirmation ${s.confirmationTimeframe} → entry ${s.entryTimeframe}`,
+    `Minimum reward:risk: ${s.minRiskReward}:1`,
+    `Mindset habits selected: ${s.mindset.length ? s.mindset.map(i => MINDSET_HABITS[i]).join(", ") : "None yet"}`,
+    "Commands: /assets, /strategy, /timeframes, /risk, /mindset, /settings",
+  ].join("\n");
+}
+
 
 async function getBybitDemoStatus() {
   const apiKey = process.env.BYBIT_API_KEY;
@@ -90,6 +156,138 @@ async function getBybitDemoStatus() {
       message: `Connection failed: ${error.message}`
     };
   }
+}
+
+
+// Automatic execution is deliberately OFF until /tradeon is used in Telegram.
+let autoTradingEnabled = false;
+const lastExecutedSignalAt = new Map();
+const TRADE_LEVERAGE = 25;
+const MAX_MARGIN_USDT = 5;
+const MAX_WALLET_RISK_FRACTION = 0.10;
+const EXECUTION_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+
+function bybitSignature(timestamp, apiKey, recvWindow, payload, secret) {
+  return createHmac("sha256", secret)
+    .update(timestamp + apiKey + recvWindow + payload)
+    .digest("hex");
+}
+
+async function bybitPrivateRequest(method, path, paramsOrBody = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (process.env.BYBIT_DEMO_TRADING !== "true" || !apiKey || !apiSecret) {
+    throw new Error("Bybit Demo mode or API credentials are not configured.");
+  }
+  const timestamp = Date.now().toString();
+  const query = method === "GET"
+    ? new URLSearchParams(Object.entries(paramsOrBody).sort(([a], [b]) => a.localeCompare(b))).toString()
+    : "";
+  const bodyText = method === "GET" ? "" : JSON.stringify(paramsOrBody);
+  const payload = method === "GET" ? query : bodyText;
+  const signature = bybitSignature(timestamp, apiKey, BYBIT_RECV_WINDOW, payload, apiSecret);
+  const url = `${BYBIT_DEMO_API}${path}${query ? `?${query}` : ""}`;
+  const response = await fetch(url, {
+    method,
+    headers: {
+      "X-BAPI-API-KEY": apiKey,
+      "X-BAPI-TIMESTAMP": timestamp,
+      "X-BAPI-RECV-WINDOW": BYBIT_RECV_WINDOW,
+      "X-BAPI-SIGN": signature,
+      "X-BAPI-SIGN-TYPE": "2",
+      ...(method === "GET" ? {} : { "Content-Type": "application/json" }),
+    },
+    ...(method === "GET" ? {} : { body: bodyText }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const data = await response.json();
+  const unchangedLeverage = path === "/v5/position/set-leverage" && data.retCode === 110043;
+  if (!response.ok || (data.retCode !== 0 && !unchangedLeverage)) {
+    throw new Error(`Bybit ${data.retCode ?? response.status}: ${data.retMsg ?? response.statusText}`);
+  }
+  return data.result;
+}
+
+function decimalsFromStep(step) {
+  const text = String(step);
+  return text.includes(".") ? text.split(".")[1].replace(/0+$/, "").length : 0;
+}
+
+async function getOpenBybitPosition(symbol) {
+  const result = await bybitPrivateRequest("GET", "/v5/position/list", {
+    category: "linear", symbol, settleCoin: "USDT",
+  });
+  return (result?.list || []).find(position => Number(position.size) > 0) || null;
+}
+
+async function executeDemoTrade(signal) {
+  if (!autoTradingEnabled) return { skipped: true, message: "Automatic trading is OFF." };
+  if (!BYBIT_ALLOWED_SYMBOLS.has(signal.symbol)) return { skipped: true, message: "Symbol is not on the allowed list." };
+  if (!(["LONG", "SHORT"].includes(signal.direction))) return { skipped: true, message: "Signal is not a trade." };
+  const entry = Number(signal.entry);
+  const stopLoss = Number(signal.stopLoss);
+  const takeProfit = Number(signal.takeProfit);
+  if (![entry, stopLoss, takeProfit].every(Number.isFinite) || entry <= 0 || stopLoss <= 0 || takeProfit <= 0 ||
+      (signal.direction === "LONG" && !(stopLoss < entry && takeProfit > entry)) ||
+      (signal.direction === "SHORT" && !(takeProfit < entry && stopLoss > entry))) {
+    return { skipped: true, message: "Signal entry/SL/TP failed validation." };
+  }
+
+  const cooldownKey = `${signal.symbol}-${signal.direction}`;
+  if (Date.now() - (lastExecutedSignalAt.get(cooldownKey) || 0) < EXECUTION_COOLDOWN_MS) {
+    return { skipped: true, message: "Same-direction signal is in the 4-hour execution cooldown." };
+  }
+  const existing = await getOpenBybitPosition(signal.symbol);
+  if (existing) return { skipped: true, message: `Position already open for ${signal.symbol}; no duplicate order placed.` };
+
+  const status = await getBybitDemoStatus();
+  if (!status.ok) throw new Error(status.message);
+  const walletBalance = Number(status.walletBalance);
+  const marginUsdt = Math.min(MAX_MARGIN_USDT, walletBalance * MAX_WALLET_RISK_FRACTION);
+  if (!Number.isFinite(walletBalance) || marginUsdt <= 0) throw new Error("Demo wallet balance is not sufficient.");
+
+  const [tickerResult, instrumentResult] = await Promise.all([
+    bybitPrivateRequest("GET", "/v5/market/tickers", { category: "linear", symbol: signal.symbol }),
+    bybitPrivateRequest("GET", "/v5/market/instruments-info", { category: "linear", symbol: signal.symbol }),
+  ]);
+  const lastPrice = Number(tickerResult?.list?.[0]?.lastPrice);
+  const instrument = instrumentResult?.list?.[0];
+  const qtyStep = Number(instrument?.lotSizeFilter?.qtyStep);
+  const minQty = Number(instrument?.lotSizeFilter?.minOrderQty);
+  const minNotional = Number(instrument?.lotSizeFilter?.minNotionalValue || 0);
+  const tickSize = Number(instrument?.priceFilter?.tickSize);
+  if (![lastPrice, qtyStep, minQty, tickSize].every(v => Number.isFinite(v) && v > 0)) {
+    throw new Error("Could not validate Bybit price/quantity rules.");
+  }
+  const notional = marginUsdt * TRADE_LEVERAGE;
+  const rawQty = notional / lastPrice;
+  const qty = Math.floor(rawQty / qtyStep) * qtyStep;
+  const qtyText = qty.toFixed(decimalsFromStep(qtyStep));
+  if (qty < minQty || qty * lastPrice < minNotional) {
+    return { skipped: true, message: `Safe size is below Bybit minimum for ${signal.symbol}; no order placed.` };
+  }
+  const priceDecimals = decimalsFromStep(tickSize);
+  const tp = (Math.round(takeProfit / tickSize) * tickSize).toFixed(priceDecimals);
+  const sl = (Math.round(stopLoss / tickSize) * tickSize).toFixed(priceDecimals);
+  if ((signal.direction === "LONG" && !(Number(sl) < lastPrice && Number(tp) > lastPrice)) ||
+      (signal.direction === "SHORT" && !(Number(tp) < lastPrice && Number(sl) > lastPrice))) {
+    return { skipped: true, message: "Live Demo price moved past the signal SL/TP; no order placed." };
+  }
+
+  await bybitPrivateRequest("POST", "/v5/position/set-leverage", {
+    category: "linear", symbol: signal.symbol,
+    buyLeverage: String(TRADE_LEVERAGE), sellLeverage: String(TRADE_LEVERAGE),
+  });
+  const order = await bybitPrivateRequest("POST", "/v5/order/create", {
+    category: "linear", symbol: signal.symbol,
+    side: signal.direction === "LONG" ? "Buy" : "Sell",
+    orderType: "Market", qty: qtyText, positionIdx: 0,
+    tpslMode: "Full", takeProfit: tp, stopLoss: sl,
+    tpTriggerBy: "MarkPrice", slTriggerBy: "MarkPrice",
+    tpOrderType: "Market", slOrderType: "Market",
+  });
+  lastExecutedSignalAt.set(cooldownKey, Date.now());
+  return { skipped: false, orderId: order?.orderId || "accepted", qty: qtyText, leverage: TRADE_LEVERAGE, marginUsdt: marginUsdt.toFixed(2), tp, sl };
 }
 
 
@@ -306,7 +504,102 @@ function analyzeDailyTrend(dailyCandles) {
 }
 
 
-export async function performMultiTimeframeAnalysis(symbol) {
+/**
+ * CRT: use the previous completed 4H candle as the range and the latest
+ * completed 15M candle for a liquidity sweep + close back inside confirmation.
+ * This function only creates alerts; it never places an order.
+ */
+export async function analyzeCRT(symbol) {
+  const normalized = symbol?.trim().toUpperCase();
+  if (!BYBIT_ALLOWED_SYMBOLS.has(normalized)) {
+    throw new Error(`Unsupported CRT symbol. Use: ${[...BYBIT_ALLOWED_SYMBOLS].join(", ")}`);
+  }
+
+  const now = Date.now();
+  const [raw4h, raw15m] = await Promise.all([
+    fetchBybitCandles(normalized, "4h", 10, 4 * 60 * 60 * 1000),
+    fetchBybitCandles(normalized, "15m", 20, 15 * 60 * 1000),
+  ]);
+  const candles4h = raw4h.filter(c => c.closeTime <= now);
+  const candles15m = raw15m.filter(c => c.closeTime <= now);
+  if (candles4h.length < 2 || candles15m.length < 3) {
+    throw new Error("Not enough completed candles for CRT analysis.");
+  }
+
+  // The latest fully closed 4H candle defines the CRT range.
+  const range = candles4h[candles4h.length - 1];
+  const signalCandle = candles15m[candles15m.length - 1];
+  const rangeHigh = range.high;
+  const rangeLow = range.low;
+  const sweptHigh = signalCandle.high > rangeHigh && signalCandle.close < rangeHigh;
+  const sweptLow = signalCandle.low < rangeLow && signalCandle.close > rangeLow;
+
+  if (!sweptHigh && !sweptLow) {
+    return {
+      symbol: normalized, direction: "WAIT", rangeHigh, rangeLow,
+      entry: signalCandle.close, signalCandleTime: signalCandle.startTime,
+      message: `⏳ CRT: No confirmed 15M sweep-and-close-back-inside setup for ${normalized}.
+4H range high: ${formatPrice(rangeHigh)}
+4H range low: ${formatPrice(rangeLow)}`
+    };
+  }
+
+  // If one candle somehow sweeps both sides, avoid guessing direction.
+  if (sweptHigh && sweptLow) {
+    return {
+      symbol: normalized, direction: "WAIT", rangeHigh, rangeLow,
+      entry: signalCandle.close, signalCandleTime: signalCandle.startTime,
+      message: `⏳ CRT: Both sides were swept on the same 15M candle for ${normalized}; no signal.`
+    };
+  }
+
+  const direction = sweptLow ? "LONG" : "SHORT";
+  const entry = signalCandle.close;
+  const stopLoss = sweptLow ? signalCandle.low : signalCandle.high;
+  const takeProfit = sweptLow ? rangeHigh : rangeLow;
+  const risk = Math.abs(entry - stopLoss);
+  const reward = Math.abs(takeProfit - entry);
+
+  if (!risk || !reward || reward / risk < 1) {
+    return {
+      symbol: normalized, direction: "WAIT", rangeHigh, rangeLow, entry,
+      signalCandleTime: signalCandle.startTime,
+      message: `⏳ CRT: Sweep detected on ${normalized}, but the entry-to-target risk/reward is below 1:1. No signal.`
+    };
+  }
+
+  const sideText = direction === "LONG" ? "Bullish" : "Bearish";
+
+  const message = [
+    `🎯 *CRT ${sideText} SIGNAL — ${normalized}*`,
+    `⏱️ Range: previous completed 4H candle`,
+    `🔎 Confirmation: completed 15M liquidity sweep + close back inside`,
+    `📍 Direction: *${direction}*`,
+    `Entry reference: ${formatPrice(entry)}`,
+    `Stop-loss reference: ${formatPrice(stopLoss)}`,
+    `Take-profit target: ${formatPrice(takeProfit)} (opposite side of 4H range)`,
+    `4H range high: ${formatPrice(rangeHigh)}`,
+    `4H range low: ${formatPrice(rangeLow)}`,
+    `Estimated R:R: ${(reward / risk).toFixed(2)}:1`,
+    `⚠️ Signal only — no trade was placed. Verify the setup before acting.`
+  ].join("\n");
+
+  return {
+    symbol: normalized, direction, entry, stopLoss, takeProfit,
+    rangeHigh, rangeLow, signalCandleTime: signalCandle.startTime,
+    score: 70,
+    reasons: [
+      `Previous completed 4H candle range: ${formatPrice(rangeLow)}–${formatPrice(rangeHigh)}.`,
+      sweptLow
+        ? "15M candle swept the 4H low and closed back above it."
+        : "15M candle swept the 4H high and closed back below it.",
+      "CRT is alert-only; automatic order execution is not used."
+    ],
+    message
+  };
+}
+
+async function performMultiTimeframeAnalysis(symbol) {
   const normalized = symbol?.trim().toUpperCase();
 
   if (!BYBIT_ALLOWED_SYMBOLS.has(normalized)) {
@@ -357,6 +650,7 @@ export async function performMultiTimeframeAnalysis(symbol) {
 
   let direction = "WAIT";
   let score = 40;
+
   const reasons = [
     "Market data: Bybit Demo public candles",
     "Context: completed 15m candles",
@@ -382,724 +676,6 @@ export async function performMultiTimeframeAnalysis(symbol) {
     reasons.push("No matching 5m confirmation; waiting.");
   }
 
-  let entry = currentPrice;
-  let stopLoss = 0;
-  let takeProfit = 0;
-
-  if (direction === "LONG" && activePoi) {
-    stopLoss = activePoi.low * 0.998;
-    const risk = entry - stopLoss;
-
-    if (risk > 0) {
-      takeProfit = entry + risk * 2;
-    } else {
-      direction = "WAIT";
-    }
-  } else if (direction === "SHORT" && activePoi) {
-    stopLoss = activePoi.high * 1.002;
-    const risk = stopLoss - entry;
-
-    if (risk > 0) {
-      takeProfit = entry - risk * 2;
-    } else {
-      direction = "WAIT";
-    }
-  }
-
-  return {
-        symbol: normalized,
-    direction,
-    score,
-    entry,
-    stopLoss,
-    takeProfit,
-    reasons,
-  };
-}
-
-function formatPrice(value) {
-  if (!value) return "0.00";
-  const decimals = value >= 100 ? 2 : value >= 1 ? 4 : 6;
-  return value.toLocaleString("en-US", {
-    minimumFractionDigits: decimals,
-    maximumFractionDigits: decimals,
-  });
-}
-
-async function loadMonitorState() {
-  try {
-    const saved = await readFile(MONITOR_FILE, "utf8");
-    const monitors = JSON.parse(saved);
-    for (const monitor of monitors) {
-      if (monitor?.id) activeMonitors.set(monitor.id, monitor);
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT") console.error("Could not load monitor state:", error.message);
-  }
-}
-
-function saveMonitorState() {
-  const snapshot = JSON.stringify([...activeMonitors.values()], null, 2);
-  persistenceQueue = persistenceQueue.catch(() => {}).then(() => writeFile(MONITOR_FILE, snapshot, "utf8"));
-  return persistenceQueue;
-}
-
-async function registerMonitor(token, chatId, result) {
-  if (!["LONG", "SHORT"].includes(result.direction)) return;
-  const entry = Number(result.entry);
-  const stopLoss = Number(result.stopLoss);
-  const takeProfit = Number(result.takeProfit);
-
-  if (!Number.isFinite(entry) || !Number.isFinite(stopLoss) || !Number.isFinite(takeProfit) || entry <= 0 || stopLoss <= 0 || takeProfit <= 0) return;
-
-  const risk = result.direction === "LONG" ? entry - stopLoss : stopLoss - entry;
-  if (risk <= 0) return;
-
-  const existing = [...activeMonitors.values()].find(
-    (m) => String(m.chatId) === String(chatId) && m.symbol === result.symbol && m.status === "ACTIVE"
-  );
-  if (existing) return;
-
-  const monitor = {
-    id: `${chatId}-${result.symbol}-${Date.now()}`,
-    chatId,
-    symbol: result.symbol,
-    direction: result.direction,
-    entry,
-    stopLoss,
-    takeProfit,
-    risk,
-    oneRAlerted: false,
-    adverseAlerted: false,
-    status: "ACTIVE",
-    createdAt: new Date().toISOString(),
-    lastCheckedCandle: null,
-  };
-
-  activeMonitors.set(monitor.id, monitor);
-  await saveMonitorState();
-}
-
-async function checkOneMonitor(token, monitor) {
-  if (monitor.status !== "ACTIVE") return;
-  const candles = await fetchCandles(monitor.symbol, "1m", 3, 60 * 1000);
-  if (!candles.length) return;
-  const candle = candles[candles.length - 1];
-
-  const isLong = monitor.direction === "LONG";
-  const hitStop = isLong ? candle.low <= monitor.stopLoss : candle.high >= monitor.stopLoss;
-  const hitTarget = isLong ? candle.high >= monitor.takeProfit : candle.low <= monitor.takeProfit;
-
-  if (hitStop && hitTarget) {
-    monitor.status = "AMBIGUOUS";
-    await saveMonitorState();
-    return;
-  }
-  if (hitStop) {
-    monitor.status = "STOP_TOUCHED";
-    await saveMonitorState();
-    return;
-  }
-  if (hitTarget) {
-    monitor.status = "TARGET_TOUCHED";
-    await saveMonitorState();
-    return;
-  }
-}
-
-async function runMonitorLoop(token) {
-  while (true) {
-    try {
-      for (const monitor of activeMonitors.values()) {
-        if (monitor.status !== "ACTIVE") continue;
-        try { await checkOneMonitor(token, monitor); } catch (e) {}
-      }
-    } catch (e) {}
-    await sleep(15000);
-  }
-}
-
-async function loadSubscribers() {
-  try {
-    const saved = JSON.parse(await readFile(SUBSCRIBERS_FILE, "utf8"));
-    for (const id of saved) autoSubscribers.add(String(id));
-  } catch (error) {
-    if (error.code !== "ENOENT") console.error("Could not load subscribers:", error.message);
-  }
-}
-
-async function saveSubscribers() {
-  await writeFile(SUBSCRIBERS_FILE, JSON.stringify([...autoSubscribers]), "utf8");
-}
-
-function buildAlertMessage(result) {
-  const icon = result.direction === "LONG" ? "📈" : "📉";
-  return [
-    `🚨 *AUTO ALERT*`,
-    `🪙 Pair: ${result.symbol}`,
-    `${icon} Signal: ${result.direction} (Confidence:${result.score}%)`,
-    `🎯 Entry: ${formatPrice(result.entry)}`,
-    `🟢 TP: ${formatPrice(result.takeProfit)}`,
-    `🔴 SL: ${formatPrice(result.stopLoss)}`,
-    ``,
-    ...result.reasons.map((r) => `• ${r}`),
-  ].join("\n");
-}
-
-
-export function detectBreakOfStructure(candles, options = {}) {
-  const pivotStrength = options.pivotStrength ?? 3;
-  const atrPeriod = options.atrPeriod ?? 14;
-  const displacementAtr = options.displacementAtr ?? 0.6;
-
-  if (
-    !Array.isArray(candles) ||
-    !Number.isInteger(pivotStrength) ||
-    pivotStrength < 1 ||
-    !Number.isInteger(atrPeriod) ||
-    atrPeriod < 1 ||
-    !Number.isFinite(displacementAtr) ||
-    displacementAtr < 0 ||
-    candles.length < Math.max(atrPeriod + 2, pivotStrength * 2 + 5)
-  ) {
-    return {
-      direction: "NONE",
-      reason: "Not enough valid candles or invalid detector settings."
-    };
-  }
-
-  const valid = candles.every(c =>
-    Number.isFinite(c.open) &&
-    Number.isFinite(c.high) &&
-    Number.isFinite(c.low) &&
-    Number.isFinite(c.close) &&
-    c.high >= Math.max(c.open, c.close, c.low) &&
-    c.low <= Math.min(c.open, c.close, c.high)
-  );
-
-  if (!valid) {
-    return {
-      direction: "NONE",
-      reason: "Invalid candle data."
-    };
-  }
-
-  // The caller must supply completed candles only.
-  const last = candles[candles.length - 1];
-
-  const trueRanges = candles.slice(1).map((c, i) =>
-    Math.max(
-      c.high - c.low,
-      Math.abs(c.high - candles[i].close),
-      Math.abs(c.low - candles[i].close)
-    )
-  );
-
-  const recentTR = trueRanges.slice(-atrPeriod);
-  const atr = recentTR.reduce((sum, v) => sum + v, 0) / recentTR.length;
-  const body = Math.abs(last.close - last.open);
-
-  if (!(atr > 0)) {
-    return { direction: "NONE", reason: "ATR is zero or invalid." };
-  }
-
-  let swingHigh = null;
-  let swingLow = null;
-
-  // Leave the newest candle as the breakout candidate.
-  const lastPivotIndex = candles.length - pivotStrength - 2;
-
-  for (let i = lastPivotIndex; i >= pivotStrength; i--) {
-    const candidate = candles[i];
-    let isHigh = true;
-    let isLow = true;
-
-    for (let j = i - pivotStrength; j <= i + pivotStrength; j++) {
-      if (j === i) continue;
-
-      if (candles[j].high >= candidate.high) isHigh = false;
-      if (candles[j].low <= candidate.low) isLow = false;
-    }
-
-    if (isHigh && !swingHigh) {
-      const brokenEarlier = candles
-        .slice(i + pivotStrength + 1, candles.length - 1)
-        .some(c => c.close > candidate.high);
-
-      if (!brokenEarlier) {
-        swingHigh = { index: i, level: candidate.high };
-      }
-    }
-
-    if (isLow && !swingLow) {
-      const brokenEarlier = candles
-        .slice(i + pivotStrength + 1, candles.length - 1)
-        .some(c => c.close < candidate.low);
-
-      if (!brokenEarlier) {
-        swingLow = { index: i, level: candidate.low };
-      }
-    }
-
-    if (swingHigh && swingLow) break;
-  }
-
-  const bullishBreak = swingHigh && last.close > swingHigh.level;
-  const bearishBreak = swingLow && last.close < swingLow.level;
-
-  if (bullishBreak && bearishBreak) {
-    return {
-      direction: "NONE",
-      reason: "Conflicting structure breaks."
-    };
-  }
-
-  if (!bullishBreak && !bearishBreak) {
-    const sweptHigh = swingHigh &&
-      last.high > swingHigh.level &&
-      last.close <= swingHigh.level;
-
-    const sweptLow = swingLow &&
-      last.low < swingLow.level &&
-      last.close >= swingLow.level;
-
-    return {
-      direction: "NONE",
-      reason: sweptHigh || sweptLow
-        ? "Wick sweep without candle-close confirmation."
-        : "No confirmed swing break."
-    };
-  }
-
-  if (body < atr * displacementAtr) {
-    return {
-      direction: "NONE",
-      reason: "Breakout lacks sufficient ATR displacement."
-    };
-  }
-
-  if (bullishBreak && last.close <= last.open) {
-    return {
-      direction: "NONE",
-      reason: "Bullish BOS requires a bullish candle."
-    };
-  }
-
-  if (bearishBreak && last.close >= last.open) {
-    return {
-      direction: "NONE",
-      reason: "Bearish BOS requires a bearish candle."
-    };
-  }
-
-  const bullish = Boolean(bullishBreak);
-
-  return {
-    direction: bullish ? "BULLISH" : "BEARISH",
-    level: bullish ? swingHigh.level : swingLow.level,
-    candleTime: last.startTime ?? null,
-    reason: `Confirmed ${bullish ? "bullish" : "bearish"} BOS: close beyond swing with displacement.`
-  };
-}
-
-
-function analyzeBreakOfStructure(candles, symbol, timeframe = "15m") {
-  if (!candles || candles.length < 20) return null;
-
-  const completedCandles = candles.slice(0, -1);
-  const currentCandle = candles[candles.length - 1];
-
-  let recentSwingHigh = -Infinity;
-  let recentSwingLow = Infinity;
-
-  const lookback = completedCandles.slice(-15);
-  for (const c of lookback) {
-    if (c.high > recentSwingHigh) recentSwingHigh = c.high;
-    if (c.low < recentSwingLow) recentSwingLow = c.low;
-  }
-
-  const currentBody = Math.abs(currentCandle.close - currentCandle.open);
-  const currentRange = currentCandle.high - currentCandle.low;
-  const isDisplacement = currentRange > 0 && (currentBody / currentRange) >= 0.55;
-
-  // 1. BULLISH BOS CHECK
-  if (currentCandle.close > recentSwingHigh) {
-    return [
-      `🚨 *BREAK OF STRUCTURE (BOS)*`,
-      `Pair: ${symbol}`,
-      `Timeframe: ${timeframe}`,
-      `Broken swing high: ${formatPrice(recentSwingHigh)}`,
-      `Candle close: ${formatPrice(currentCandle.close)}`,
-      `Displacement: ${isDisplacement ? "Confirmed" : "Weak"}`,
-      `Wick-only break: Rejected`,
-      `Reasons for confirmation`,
-      `• Completed candle closed above the previous confirmed swing high.`,
-      `• Candle body met the displacement threshold.`,
-      `• Break passed the balanced confirmation rules.`,
-      `Result: Potential bullish structure continuation. Wait for your entry setup; BOS alone is not an automatic buy signal.`
-    ].join("\n");
-  }
-
-  // 2. BEARISH BOS CHECK
-  if (currentCandle.close < recentSwingLow) {
-    return [
-      `🚨 *BREAK OF STRUCTURE (BOS)*`,
-      `Pair: ${symbol}`,
-      `Timeframe: ${timeframe}`,
-      `Broken swing low: ${formatPrice(recentSwingLow)}`,
-      `Candle close: ${formatPrice(currentCandle.close)}`,
-      `Displacement: ${isDisplacement ? "Confirmed" : "Weak"}`,
-      `Wick-only break: Rejected`,
-      `Reasons for confirmation`,
-      `• Completed candle closed below the previous confirmed swing low.`,
-      `• Candle body met the displacement threshold.`,
-      `• Break passed the balanced confirmation rules.`,
-      `Result: Potential bearish structure continuation. Wait for your entry setup; BOS alone is not an automatic sell signal.`
-    ].join("\n");
-  }
-
-  return null;
-}
-
-export async function analyzeCRT(symbol) {
-  const normalized = symbol?.trim().toUpperCase();
-  if (!BYBIT_ALLOWED_SYMBOLS.has(normalized)) {
-    throw new Error(`Unsupported CRT symbol. Use: ${[...BYBIT_ALLOWED_SYMBOLS].join(", ")}`);
-  }
-
-  const [raw4h, raw15m] = await Promise.all([
-    fetchBybitCandles(normalized, "4h", 10, 4 * 60 * 60 * 1000),
-    fetchBybitCandles(normalized, "15m", 20, 15 * 60 * 1000),
-  ]);
-  const now = Date.now();
-  const candles4h = raw4h.filter(c => c.closeTime <= now);
-  const candles15m = raw15m.filter(c => c.closeTime <= now);
-  if (candles4h.length < 2 || candles15m.length < 2) {
-    throw new Error("Not enough completed 4H/15M candles returned.");
-  }
-
-  // Use the most recently completed 4H candle as the dealing range.
-  const range = candles4h[candles4h.length - 1];
-  const signalCandle = candles15m[candles15m.length - 1];
-  const rangeHigh = range.high;
-  const rangeLow = range.low;
-  const sweptHigh = signalCandle.high > rangeHigh && signalCandle.close < rangeHigh;
-  const sweptLow = signalCandle.low < rangeLow && signalCandle.close > rangeLow;
-  const fmt = value => Number(value).toLocaleString("en-US", { maximumFractionDigits: 8 });
-
-  if (sweptHigh === sweptLow) {
-    return { symbol: normalized, direction: "WAIT", message: `⏳ CRT: WAIT
-Pair: ${normalized}
-4H range high: ${fmt(rangeHigh)}
-4H range low: ${fmt(rangeLow)}
-No single-sided 15M sweep-and-close-back-inside confirmation.
-Signals only — no trade was placed.` };
-  }
-
-  const direction = sweptLow ? "LONG" : "SHORT";
-  const entry = signalCandle.close;
-  const stopLoss = sweptLow ? signalCandle.low : signalCandle.high;
-  const takeProfit = sweptLow ? rangeHigh : rangeLow;
-  const risk = Math.abs(entry - stopLoss);
-  const reward = Math.abs(takeProfit - entry);
-  if (!(risk > 0) || !(reward > 0) || reward / risk < 1) {
-    return { symbol: normalized, direction: "WAIT", message: `⏳ CRT: WAIT
-Pair: ${normalized}
-Sweep found, but the setup does not meet minimum 1:1 reward-to-risk.
-Signals only — no trade was placed.` };
-  }
-
-  const message = [
-    `🎯 CRT ${direction} SIGNAL`,
-    `Pair: ${normalized}`,
-    `Range timeframe: 4H (completed candle)`,
-    `Confirmation: 15M sweep and close back inside range`,
-    `Entry: ${fmt(entry)}`,
-    `TP: ${fmt(takeProfit)}`,
-
-        `SL: ${fmt(stopLoss)}`,
-    `Range high: ${fmt(rangeHigh)}`,
-    `Range low: ${fmt(rangeLow)}`,
-    `Reward:risk: ${(reward / risk).toFixed(2)}:1`,
-    `Signals only — no trade was placed.`,
-  ].join("\n");
-  return { symbol: normalized, direction, entry, stopLoss, takeProfit, rangeHigh, rangeLow, signalCandleTime: signalCandle.startTime, score: 70, reasons: ["Completed 4H range used", "15M wick swept one range boundary and candle closed back inside", "Minimum 1:1 reward-to-risk passed"], message };
-}
-
-async function runAutoScan(token) {
-  while (true) {
-    if (autoSubscribers.size > 0) {
-      for (const symbol of AUTO_SCAN_SYMBOLS) {
-        try {
-          // 15-Minute Break of Structure Check
-          const bosCandles = await fetchCandles(symbol, "15m", 30, 15 * 60 * 1000);
-          const bosAlertText = analyzeBreakOfStructure(bosCandles, symbol, "15 minutes");
-
-          if (bosAlertText) {
-            for (const chatId of autoSubscribers) {
-              const key = `BOS-${chatId}-${symbol}`;
-              const last = lastAlertAt.get(key) || 0;
-              
-              if (Date.now() - last < ALERT_COOLDOWN_MS) continue;
-
-              lastAlertAt.set(key, Date.now());
-              await sendMessage(token, chatId, bosAlertText);
-            }
-          }
-          
-          // CRT is signal-only and has its own per-candle duplicate guard.
-          const crtResult = await analyzeCRT(symbol);
-          if (crtResult.direction === "LONG" || crtResult.direction === "SHORT") {
-            for (const chatId of autoSubscribers) {
-              const crtKey = `CRT-${chatId}-${symbol}-${crtResult.signalCandleTime}`;
-              if (lastAlertAt.has(crtKey)) continue;
-              lastAlertAt.set(crtKey, Date.now());
-              await sendMessage(token, chatId, crtResult.message);
-            }
-          }
-
-          const result = await performMultiTimeframeAnalysis(symbol, "4h");
-          if (result.direction === "WAIT") continue;
-
-          for (const chatId of autoSubscribers) {
-            const key = `${chatId}-${symbol}-${result.direction}`;
-            const last = lastAlertAt.get(key) || 0;
-            if (Date.now() - last < ALERT_COOLDOWN_MS) continue;
-
-            const hasActive = [...activeMonitors.values()].some(
-              (m) =>
-                String(m.chatId) === String(chatId) &&
-                m.symbol === result.symbol &&
-                m.status === "ACTIVE",
-            );
-            if (hasActive) continue;
-
-            lastAlertAt.set(key, Date.now());
-            await sendMessage(token, chatId, buildAlertMessage(result));
-            await registerMonitor(token, chatId, result);
-          }
-        } catch (error) {
-          console.error(`Auto-scan error for ${symbol}:`, error.message);
-        }
-      }
-    }
-    await sleep(AUTO_SCAN_INTERVAL_MS);
-  }
-}
-
-async function callTelegram(token, method, body) {
-  const res = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = await res.json();
-  return data.result;
-}
-
-async function sendMessage(token, chatId, text) {
-  await callTelegram(token, "sendMessage", {
-    chat_id: chatId,
-    text,
-    parse_mode: "Markdown",
-  });
-}
-
-async function handleMessage(token, message) {
-  const text = message.text?.trim();
-  if (!text || !message.chat?.id) return;
-  const match = text.match(/^(\/[a-z]+)(?:\s+(.+))?$/i);
-  if (!match) return;
-
-  const command = match[1].toLowerCase();
-  const args = (match[2] || "").trim().split(/\s+/).filter(Boolean);
-  const chatId = message.chat.id;
-
-  if (command === "/start" || command === "/help") {
-    await sendMessage(
-      token,
-      chatId,
-            "🤖 *Supply & Demand, BOS & CRT Bot*\n/crt <symbol> — Check CRT (4H range → 15M confirmation)\n/analyze <symbol> — Top-Down Analysis\n/bos <symbol> — Check 15m Break of Structure\n/autoon — Enable auto scans\n/autooff — Disable auto scans\n/autostatus — Check auto scans\n/demostatus — Check Bybit Demo connection",);
-    return;
-  }
-
-  if (command === "/autoon") {
-    autoSubscribers.add(String(chatId));
-    await saveSubscribers();
-    await sendMessage(
-      token,
-      chatId,
-      `✅ Auto alerts ON. Scanning ${AUTO_SCAN_SYMBOLS.join(", ")} every 5 minutes. Use /autooff to stop.`,
-    );
-    return;
-  }
-
-  if (command === "/autooff") {
-    autoSubscribers.delete(String(chatId));
-    await saveSubscribers();
-    await sendMessage(token, chatId, "🛑 Auto alerts OFF.");
-    return;
-  }
-
-  if (command === "/autostatus") {
-    const on = autoSubscribers.has(String(chatId));
-    await sendMessage(
-      token,
-      chatId,
-      `Auto alerts: ${on ? "ON" : "OFF"}\nWatching: ${AUTO_SCAN_SYMBOLS.join(", ")}`,
-    );
-    return;
-  }
-
-  
-  if (command === "/bybitcheck") {
-    await sendMessage(
-      token,
-      chatId,
-      "🔎 Testing Bybit Demo market candles..."
-    );
-
-    const symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
-    const results = [];
-
-    for (const symbol of symbols) {
-      try {
-        const candles = await fetchBybitCandles(
-          symbol,
-          "15m",
-          10,
-          15 * 60 * 1000
-        );
-
-        const completed = candles.filter(
-          (candle) => candle.closeTime <= Date.now()
-        );
-
-        if (completed.length < 2) {
-          throw new Error("Not enough completed candles.");
-        }
-
-        const last = completed[completed.length - 1];
-
-        results.push(
-          `✅ ${symbol}: OK\n` +
-          `Last completed 15m close: ${last.close}`
-        );
-      } catch (error) {
-        results.push(
-          `❌ ${symbol}: ${error.message}`
-        );
-      }
-    }
-
-    await sendMessage(
-      token,
-      chatId,
-      "📊 Bybit Market Data Test\n\n" +
-      results.join("\n\n") +
-      "\n\n🔒 Public market data only. No orders placed."
-    );
-
-    return;
-  }
-  
-  if (command === "/demostatus") {
-    await sendMessage(
-      token,
-      chatId,
-      "🔎 Checking Bybit Demo connection... No orders will be placed."
-    );
-
-    const status = await getBybitDemoStatus();
-
-    if (!status.ok) {
-      await sendMessage(
-        token,
-        chatId,
-        `❌ Bybit Demo check failed:\n${status.message}`
-      );
-      return;
-    }
-
-    await sendMessage(
-      token,
-      chatId,
-      `✅ ${status.message}\nAccount: ${status.accountType}\nUSDT wallet balance: ${status.walletBalance}\n\n🔒 Read-only check. No trades placed.`
-    );
-    return;
-  }
-  
-  
-  // On-demand manual BOS test command
-  
-
-if (text === "/bos" || text.startsWith("/bos ")) {
-  const symbolInput = text.split(/\s+/)[1] || "BTCUSDT";
-  const symbol = symbolInput.toUpperCase();
-
-  const allowedSymbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
-
-  if (!allowedSymbols.includes(symbol)) {
-    await sendMessage(
-      token,
-      chatId,
-      "Unsupported symbol. Use /bos BTCUSDT, /bos ETHUSDT, or /bos SOLUSDT."
-    );
-    return;
-  }
-
-  try {
-    await sendMessage(
-      token,
-      chatId,
-      `Checking confirmed 15m BOS for ${symbol}...`
-    );
-
-    const candles = await fetchCandles(
-      symbol,
-      "15m",
-      100,
-      15 * 60 * 1000
-    );
-
-    if (!Array.isArray(candles) || candles.length < 25) {
-      await sendMessage(
-        token,
-        chatId,
-        `BOS check unavailable for ${symbol}: insufficient candle data.`
-      );
-      return;
-    }
-
-    // Assumes fetchCandles includes the currently forming candle.
-    const completedCandles = candles.slice(0, -1);
-
-    const result = detectBreakOfStructure(completedCandles, {
-      pivotStrength: 3,
-      atrPeriod: 14,
-      displacementAtr: 0.6
-    });
-
-    if (!result || result.direction === "NONE") {
-      await sendMessage(
-        token,
-        chatId,
-        `NO CONFIRMED BOS — ${symbol}\n` +
-        `Timeframe: 15m\n` +
-        `Reason: ${result?.reason || "No valid structure break."}`
-      );
-      return;
-    }
-
-    const direction =
-      result.direction === "BULLISH"
-        ? "BULLISH BOS"
-        : "BEARISH BOS";
-
-    const level = Number.isFinite(result.level)
-      ? result.level.toLocaleString("en-US", {
-          maximumFractionDigits: 8
-        })
       : "Unavailable";
 
     await sendMessage(
@@ -1191,8 +767,9 @@ if (text === "/bos" || text.startsWith("/bos ")) {
 
 export async function startBot(token) {
   let offset = 0;
-  console.info("Multi-Timeframe S&D, BOS & CRT signal bot running.");
+  console.info("Multi-Timeframe S&D & BOS Bot running.");
   await loadMonitorState();
+  await loadUserSettings();
   void runMonitorLoop(token);
   await loadSubscribers();
   void runAutoScan(token);
@@ -1224,6 +801,4 @@ if (
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   main().catch(console.error);
-  }
-
-    
+}
