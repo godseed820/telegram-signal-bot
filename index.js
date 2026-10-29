@@ -388,6 +388,140 @@ function analyzeDailyTrend(dailyCandles) {
   return "CONSOLIDATION";
 }
 
+
+
+// ICT model helpers: candle-based approximations using completed candles only.
+// These are rule-based proxies, not a full discretionary ICT chart reading.
+function findRecentSwing(candles, side, strength = 2) {
+  for (let i = candles.length - strength - 2; i >= strength; i--) {
+    const price = side === "HIGH" ? candles[i].high : candles[i].low;
+    let pivot = true;
+    for (let j = i - strength; j <= i + strength; j++) {
+      if (j === i) continue;
+      if (side === "HIGH" && candles[j].high >= price) pivot = false;
+      if (side === "LOW" && candles[j].low <= price) pivot = false;
+    }
+    if (pivot) return { index: i, price };
+      }
+  return null;
+}
+
+function analyzeICTModel(dailyCandles, htfCandles, ltfCandles) {
+  const daily = dailyCandles.slice(0, -1);
+  const htf = htfCandles.slice(0, -1);
+  const ltf = ltfCandles.slice(0, -1);
+  const result = {
+    previousDayHigh: null, previousDayLow: null,
+    buySideLiquidity: null, sellSideLiquidity: null,
+    liquiditySweep: "NONE", mss: "NONE", fvg: null, orderBlock: null,
+    rangeMidpoint: null, dealingRange: "UNKNOWN", killZone: "OFF",
+    aligned: false, notes: [],
+  };
+  if (daily.length) {
+    const previousDay = daily[daily.length - 1];
+    result.previousDayHigh = previousDay.high;
+    result.previousDayLow = previousDay.low;
+  }
+  if (htf.length < 10 || ltf.length < 10) {
+    result.notes.push("Not enough completed candles for reliable ICT context.");
+    return result;
+  }
+
+  const recentHtf = htf.slice(-20);
+  const rangeHigh = Math.max(...recentHtf.map(c => c.high));
+  const rangeLow = Math.min(...recentHtf.map(c => c.low));
+  result.rangeMidpoint = (rangeHigh + rangeLow) / 2;
+  const current = ltf[ltf.length - 1];
+  result.dealingRange = current.close < result.rangeMidpoint ? "DISCOUNT" : "PREMIUM";
+
+  const swingHigh = findRecentSwing(htf, "HIGH");
+  const swingLow = findRecentSwing(htf, "LOW");
+  const tolerance = current.close * 0.0015;
+  const highs = recentHtf.filter(c => Math.abs(c.high - rangeHigh) <= tolerance);
+  const lows = recentHtf.filter(c => Math.abs(c.low - rangeLow) <= tolerance);
+  result.buySideLiquidity = swingHigh?.price ?? rangeHigh;
+  result.sellSideLiquidity = swingLow?.price ?? rangeLow;
+  if (highs.length >= 2) result.notes.push("Possible equal highs / buy-side liquidity pool mapped.");
+  else result.notes.push("Buy-side liquidity mapped from recent swing high.");
+  if (lows.length >= 2) result.notes.push("Possible equal lows / sell-side liquidity pool mapped.");
+  else result.notes.push("Sell-side liquidity mapped from recent swing low.");
+
+  const pdh = result.previousDayHigh;
+  const pdl = result.previousDayLow;
+  if ((pdl != null && current.low < pdl && current.close > pdl) ||
+      (swingLow && current.low < swingLow.price && current.close > swingLow.price)) {
+    result.liquiditySweep = "SELL_SIDE_SWEPT";
+    result.notes.push("Sell-side liquidity sweep: wick below a mapped low, then close back above it.");
+  } else if ((pdh != null && current.high > pdh && current.close < pdh) ||
+             (swingHigh && current.high > swingHigh.price && current.close < swingHigh.price)) {
+    result.liquiditySweep = "BUY_SIDE_SWEPT";
+    result.notes.push("Buy-side liquidity sweep: wick above a mapped high, then close back below it.");
+  } else {
+    result.notes.push("No confirmed sweep of prior-day or recent swing liquidity on the latest completed 15m candle.");
+  }
+
+  const ltfSwingHigh = findRecentSwing(ltf, "HIGH");
+  const ltfSwingLow = findRecentSwing(ltf, "LOW");
+  const prior = ltf[ltf.length - 2];
+  if (ltfSwingHigh && prior.close <= ltfSwingHigh.price && current.close > ltfSwingHigh.price && current.close > current.open) {
+    result.mss = "BULLISH_MSS";
+    result.notes.push("Bullish MSS proxy: completed candle closed above a confirmed recent swing high.");
+  } else if (ltfSwingLow && prior.close >= ltfSwingLow.price && current.close < ltfSwingLow.price && current.close < current.open) {
+    result.mss = "BEARISH_MSS";
+    result.notes.push("Bearish MSS proxy: completed candle closed below a confirmed recent swing low.");
+  } else {
+    result.notes.push("No confirmed MSS on the latest completed 15m candle.");
+  }
+
+  // Three-candle fair value gap: non-overlap between candle 1 and candle 3.
+  for (let i = ltf.length - 1; i >= Math.max(2, ltf.length - 12); i--) {
+    const first = ltf[i - 2];
+    const third = ltf[i];
+    if (third.low > first.high) {
+      result.fvg = { type: "BULLISH_FVG", low: first.high, high: third.low };
+      break;
+    }
+    if (third.high < first.low) {
+      result.fvg = { type: "BEARISH_FVG", low: third.high, high: first.low };
+      break;
+    }
+  }
+  result.notes.push(result.fvg
+    ? `${result.fvg.type.replaceAll("_", " ")} identified at ${formatPrice(result.fvg.low)}–${formatPrice(result.fvg.high)}.`
+    : "No recent three-candle FVG found on the 15m timeframe.");
+
+  // Order-block proxy: latest opposing candle before a strong candle that closes beyond its range.
+  for (let i = ltf.length - 1; i >= Math.max(1, ltf.length - 10); i--) {
+    const impulse = ltf[i];
+    const origin = ltf[i - 1];
+    const body = Math.abs(impulse.close - impulse.open);
+    const avgRange = ltf.slice(Math.max(0, i - 14), i).reduce((sum, c) => sum + (c.high - c.low), 0) / Math.max(1, ltf.slice(Math.max(0, i - 14), i).length);
+    if (body < avgRange * 0.8) continue;
+    if (impulse.close > impulse.open && origin.close < origin.open && impulse.close > origin.high) {
+      result.orderBlock = { type: "BULLISH_ORDER_BLOCK", low: origin.low, high: origin.high };
+      break;
+    }
+    if (impulse.close < impulse.open && origin.close > origin.open && impulse.close < origin.low) {
+      result.orderBlock = { type: "BEARISH_ORDER_BLOCK", low: origin.low, high: origin.high };
+      break;
+    }
+  }
+  result.notes.push(result.orderBlock
+    ? `${result.orderBlock.type.replaceAll("_", " ")} proxy identified at ${formatPrice(result.orderBlock.low)}–${formatPrice(result.orderBlock.high)}.`
+    : "No recent displacement-backed order-block proxy found.");
+
+  // Kill-zone status uses New York local time, independent of the hosting server timezone.
+  const nyParts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(new Date());
+  const nyHour = Number(nyParts.find(p => p.type === "hour")?.value ?? 0);
+  const nyMinute = Number(nyParts.find(p => p.type === "minute")?.value ?? 0);
+  const minutes = nyHour * 60 + nyMinute;
+  if ((minutes >= 120 && minutes < 300) || (minutes >= 450 && minutes < 660)) result.killZone = "ACTIVE";
+  result.notes.push(`ICT kill-zone time filter: ${result.killZone === "ACTIVE" ? "inside a configured London/New York window" : "outside configured London/New York windows"} (informational; not used as a hard filter).`);
+  return result;
+}
+
 export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
   const market = await getKrakenMarket(symbol);
 
@@ -432,12 +566,17 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
   }
 
   const extraSetups = detectAdditionalSetups(ltfCandles);
+  const ict = analyzeICTModel(dailyCandles, htfCandles, ltfCandles);
 
   // Scoring & Setup Decision
   let score = 40;
   let direction = "WAIT";
   let reasons = [`Daily Bias: ${dailyBias}`];
-  reasons.push("Primary strategy: Supply & Demand + SMC + BOS confirmation");
+  reasons.push("Primary strategy: ICT confluence model + existing Supply & Demand / SMC filters");
+  reasons.push(`ICT liquidity sweep: ${ict.liquiditySweep}`);
+  reasons.push(`ICT MSS: ${ict.mss}`);
+  reasons.push(`ICT dealing range: ${ict.dealingRange}; midpoint ${formatPrice(ict.rangeMidpoint || 0)}`);
+  reasons.push(...ict.notes);
   if (extraSetups.setups.length) {
     reasons.push(...extraSetups.setups.map(setup => `Additional setup: ${setup}`));
   } else {
@@ -458,31 +597,27 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     reasons.push(`LTF (${ltfInterval}) confirmation candle received`);
   }
 
-  if (
-    dailyBias === "BULLISH" &&
-    activePoi?.type === "DEMAND" &&
-    ltfConfirmation === "BULLISH_CONFIRMATION" &&
-    score >= 70
-  ) {
-    direction = "LONG";
-  } else if (
-    dailyBias === "BEARISH" &&
-    activePoi?.type === "SUPPLY" &&
-    ltfConfirmation === "BEARISH_CONFIRMATION" &&
-    score >= 70
-  ) {
-    direction = "SHORT";
-  }
+  // ICT strict gate: bias + aligned HTF POI + liquidity sweep + MSS + FVG/OB + premium/discount.
+  const bullishIctZone = ict.fvg?.type === "BULLISH_FVG" || ict.orderBlock?.type === "BULLISH_ORDER_BLOCK";
+  const bearishIctZone = ict.fvg?.type === "BEARISH_FVG" || ict.orderBlock?.type === "BEARISH_ORDER_BLOCK";
+  const bullishIct = dailyBias === "BULLISH" && activePoi?.type === "DEMAND" &&
+    ict.liquiditySweep === "SELL_SIDE_SWEPT" && ict.mss === "BULLISH_MSS" &&
+    bullishIctZone && ict.dealingRange === "DISCOUNT" && score >= 70;
+  const bearishIct = dailyBias === "BEARISH" && activePoi?.type === "SUPPLY" &&
+    ict.liquiditySweep === "BUY_SIDE_SWEPT" && ict.mss === "BEARISH_MSS" &&
+    bearishIctZone && ict.dealingRange === "PREMIUM" && score >= 70;
 
-  // Additional setups are a confluence filter: they can confirm, but cannot override, the daily bias or POI.
-  if (direction === "WAIT" && extraSetups.direction === "LONG" && dailyBias === "BULLISH" && activePoi?.type === "DEMAND") {
+  if (bullishIct) {
     direction = "LONG";
-    score = Math.min(95, score + 15);
-    reasons.push("Extra setup supports the bullish daily bias and demand POI.");
-  } else if (direction === "WAIT" && extraSetups.direction === "SHORT" && dailyBias === "BEARISH" && activePoi?.type === "SUPPLY") {
+    score = Math.min(95, score + 10);
+    reasons.push("ICT checklist aligned: bullish bias, demand POI, sell-side sweep, bullish MSS, bullish FVG/OB, and discount pricing.");
+  } else if (bearishIct) {
     direction = "SHORT";
-    score = Math.min(95, score + 15);
-    reasons.push("Extra setup supports the bearish daily bias and supply POI.");
+    score = Math.min(95, score + 10);
+    reasons.push("ICT checklist aligned: bearish bias, supply POI, buy-side sweep, bearish MSS, bearish FVG/OB, and premium pricing.");
+  } else {
+    direction = "WAIT";
+    reasons.push("ICT strict filter not fully aligned. No LONG/SHORT signal until all required confluences agree.");
   }
 
   let entry = currentPrice;
@@ -507,6 +642,17 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     stopLoss,
     takeProfit,
     reasons,
+    ict: {
+      liquiditySweep: ict.liquiditySweep,
+      mss: ict.mss,
+      fvg: ict.fvg,
+      orderBlock: ict.orderBlock,
+      dealingRange: ict.dealingRange,
+      rangeMidpoint: ict.rangeMidpoint,
+      previousDayHigh: ict.previousDayHigh,
+      previousDayLow: ict.previousDayLow,
+      killZone: ict.killZone,
+    },
   };
 }
 
@@ -660,7 +806,7 @@ async function checkOneMonitor(token, monitor) {
 
   const hitStop = isLong
     ? candle.low <= monitor.stopLoss
-    : candle.high >= monitor.stopLoss;
+        : candle.high >= monitor.stopLoss;
 
   const hitTarget = isLong
     ? candle.high >= monitor.takeProfit
@@ -808,9 +954,11 @@ function buildAlertMessage(result) {
     `🚨 *AUTO ALERT*`,
     `🪙 Pair: ${result.symbol}`,
     `${icon} Signal: ${result.direction} (Confidence:${result.score}%)`,
+    `Timeframe: Daily bias + 4H POI + 15m ICT confirmation`,
     `🎯 Entry: ${formatPrice(result.entry)}`,
     `🟢 TP: ${formatPrice(result.takeProfit)}`,
     `🔴 SL: ${formatPrice(result.stopLoss)}`,
+    `Risk:Reward target: 1:2.5`,
     ``,
     ...result.reasons.map((r) => `• ${r}`),
   ].join("\n");
@@ -882,7 +1030,7 @@ async function handleMessage(token, message) {
     await sendMessage(
       token,
       chatId,
-      "🤖 *Supply & Demand Multi-TF Bot*\n/analyze <symbol> — Top-Down Analysis (Daily + 4H POI + 15m)",
+      "🤖 *Supply & Demand Multi-TF Bot*\n/analyze <symbol> — ICT Top-Down Analysis (Daily bias + 4H POI + 15m liquidity/MSS/FVG/OB)",
     );
     return;
   }
@@ -977,7 +1125,7 @@ async function handleMessage(token, message) {
     await sendMessage(
       token,
       chatId,
-      `🔍 Running S&D + SMC/BOS + Liquidity Sweep + Break/Retest + Trendline/S/R analysis on ${symbol}...`,
+      `🔍 Running ICT model + S&D/SMC: liquidity, MSS, FVG, order block, premium/discount on ${symbol}...`,
     );
     try {
       const result = await performMultiTimeframeAnalysis(symbol, "4h");
@@ -991,9 +1139,11 @@ async function handleMessage(token, message) {
       const msg = [
         `🪙 Pair: ${result.symbol}`,
         `${icon} Signal: ${result.direction} (Confidence:${result.score}%)`,
+        `Timeframe: Daily bias + 4H POI + 15m ICT confirmation`,
         `🎯 Entry: ${formatPrice(result.entry)}`,
         `🟢 TP: ${formatPrice(result.takeProfit)}`,
         `🔴 SL: ${formatPrice(result.stopLoss)}`,
+        `Risk:Reward target: 1:2.5`,
         ``,
         `🔍 *Strategy Diagnostics:*`,
         ...result.reasons.map((r) => `• ${r}`),
