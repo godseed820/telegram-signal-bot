@@ -676,7 +676,11 @@ async function performMultiTimeframeAnalysis(symbol) {
     reasons.push("No matching 5m confirmation; waiting.");
   }
 
-      : "Unavailable";
+const level = Number.isFinite(result.level)
+  ? result.level.toLocaleString("en-US", {
+      maximumFractionDigits: 8
+    })
+  : "Unavailable";
 
     await sendMessage(
       token,
