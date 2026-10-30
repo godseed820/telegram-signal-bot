@@ -1,6 +1,7 @@
 import { pathToFileURL } from "node:url";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+
 const TELEGRAM_API = "https://api.telegram.org";
 const KRAKEN_CHARTS_API = "https://futures.kraken.com/api/charts/v1";
 const MIN_PUBLIC_REQUEST_INTERVAL_MS = 500;
@@ -9,9 +10,14 @@ const activeMonitors = new Map();
 
 let persistenceQueue = Promise.resolve();
 let nextPublicRequestAt = 0;
+
+// ---------- Settings you can tweak ----------
 const AUTO_SCAN_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"];
 const AUTO_SCAN_INTERVAL_MS = 5 * 60 * 1000;
 const ALERT_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+// With 25x leverage, liquidation is roughly 3.5-4% away.
+// Signals with a stop-loss wider than this are skipped (turned into WAIT).
+const MAX_SL_PCT = 2.5;
 const SUBSCRIBERS_FILE = resolve(process.cwd(), "auto-subscribers.json");
 const autoSubscribers = new Set();
 const lastAlertAt = new Map();
@@ -31,6 +37,8 @@ const BOS_TIMEFRAMES = Object.freeze({
   "4h": 4 * 60 * 60 * 1000,
   "1d": 24 * 60 * 60 * 1000,
 });
+// Automatic alerts skip 1m and 5m (too noisy). Manual /bos still supports all.
+const BOS_AUTO_TIMEFRAMES = ["15m", "30m", "1h", "4h", "1d"];
 const lastBosAlertAt = new Map();
 
 const KRAKEN_MARKETS = Object.freeze({
@@ -94,6 +102,7 @@ async function fetchCandles(symbol, interval, count, intervalMs) {
   const rawData = await fetchKrakenJson(url);
   return parseKrakenCandles(rawData, intervalMs);
 }
+
 /**
  * Detect a balanced-confirmation Break of Structure on completed candles.
  * A BOS requires a confirmed pivot break by candle close plus directional
@@ -228,7 +237,7 @@ function formatBosMessage(result, auto = false) {
     `Reason: ${result.reason}`,
     "",
     "This is a technical structure alert, not a guaranteed trade or an order execution.",
-  ].join("\\n");
+  ].join("\n");
 }
 
 async function loadBosSubscribers() {
@@ -249,7 +258,7 @@ async function runBosAutoScan(token) {
   while (true) {
     if (bosSubscribers.size > 0) {
       for (const symbol of BOS_SYMBOLS) {
-        for (const [timeframe, intervalMs] of Object.entries(BOS_TIMEFRAMES)) {
+        for (const timeframe of BOS_AUTO_TIMEFRAMES) {
           try {
             const result = await analyzeBos(symbol, timeframe);
             if (!["BULLISH", "BEARISH"].includes(result.direction)) continue;
@@ -257,10 +266,11 @@ async function runBosAutoScan(token) {
             for (const chatId of bosSubscribers) {
               const alertKey = `${chatId}-${key}`;
               if (lastBosAlertAt.has(alertKey)) continue;
-              const prior = lastBosAlertAt.get(`${chatId}-${symbol}-${timeframe}-${result.direction}`) || 0;
+              const cooldownKey = `${chatId}-${symbol}-${timeframe}-${result.direction}`;
+              const prior = lastBosAlertAt.get(cooldownKey) || 0;
               if (Date.now() - prior < BOS_ALERT_COOLDOWN_MS) continue;
               lastBosAlertAt.set(alertKey, Date.now());
-              lastBosAlertAt.set(`${chatId}-${symbol}-${timeframe}-${result.direction}`, Date.now());
+              lastBosAlertAt.set(cooldownKey, Date.now());
               await sendMessage(token, chatId, formatBosMessage(result, true));
             }
           } catch (error) {
@@ -273,30 +283,35 @@ async function runBosAutoScan(token) {
   }
 }
 
+/**
+ * Finds supply/demand zones (order blocks) on completed candles.
+ * - Zones that price already closed through are dropped (broken).
+ * - Returned newest-first so the most recent zone is checked first.
+ */
 function identifySupplyDemandZones(candles) {
   const zones = [];
   for (let i = 2; i < candles.length - 1; i++) {
     const curr = candles[i];
     const next = candles[i + 1];
+    let zone = null;
 
     // Demand Zone (Bullish Order Block)
-    if (
-      curr.close < curr.open &&
-      next.close > next.open &&
-      next.close > curr.high
-    ) {
-      zones.push({ type: "DEMAND", high: curr.high, low: curr.low });
+    if (curr.close < curr.open && next.close > next.open && next.close > curr.high) {
+      zone = { type: "DEMAND", high: curr.high, low: curr.low, index: i };
     }
     // Supply Zone (Bearish Order Block)
-    else if (
-      curr.close > curr.open &&
-      next.close < next.open &&
-      next.close < curr.low
-    ) {
-      zones.push({ type: "SUPPLY", high: curr.high, low: curr.low });
+    else if (curr.close > curr.open && next.close < next.open && next.close < curr.low) {
+      zone = { type: "SUPPLY", high: curr.high, low: curr.low, index: i };
     }
+    if (!zone) continue;
+
+    const later = candles.slice(i + 2);
+    const broken = zone.type === "DEMAND"
+      ? later.some((c) => c.close < zone.low)
+      : later.some((c) => c.close > zone.high);
+    if (!broken) zones.push(zone);
   }
-  return zones;
+  return zones.reverse();
 }
 
 function detectAdditionalSetups(candles) {
@@ -304,9 +319,10 @@ function detectAdditionalSetups(candles) {
   if (c.length < 25) return { direction: "NONE", setups: [] };
   const last = c[c.length - 1];
   const prev = c[c.length - 2];
+  // The 20 candles right before the latest one.
   const lookback = c.slice(-21, -1);
-  const priorHigh = Math.max(...lookback.slice(0, -1).map(x => x.high));
-  const priorLow = Math.min(...lookback.slice(0, -1).map(x => x.low));
+  const priorHigh = Math.max(...lookback.map((x) => x.high));
+  const priorLow = Math.min(...lookback.map((x) => x.low));
   const setups = [];
   let direction = "NONE";
 
@@ -322,8 +338,8 @@ function detectAdditionalSetups(candles) {
   // Break-and-retest: previous candle breaks a recent level; latest candle retests and closes through in breakout direction.
   const range = c.slice(-12, -3);
   if (range.length >= 6) {
-    const resistance = Math.max(...range.map(x => x.high));
-    const support = Math.min(...range.map(x => x.low));
+    const resistance = Math.max(...range.map((x) => x.high));
+    const support = Math.min(...range.map((x) => x.low));
     if (prev.close > resistance && last.low <= resistance && last.close > resistance && last.close > last.open) {
       setups.push("Bullish break and retest confirmed at prior resistance");
       if (direction === "NONE") direction = "LONG";
@@ -333,17 +349,18 @@ function detectAdditionalSetups(candles) {
     }
   }
 
-  // Approximate S/R bounce from repeated recent extremes; trendline-like confirmation is the close through the prior candle extreme.
-  const sr = c.slice(-16, -1);
-  const support = Math.min(...sr.map(x => x.low));
-  const resistance = Math.max(...sr.map(x => x.high));
+  // Approximate S/R bounce. Levels come from candles BEFORE the latest one,
+  // so the latest candle cannot "bounce" off its own low/high.
+  const sr = c.slice(-17, -1);
+  const support = Math.min(...sr.map((x) => x.low));
+  const resistance = Math.max(...sr.map((x) => x.high));
   const nearSupport = last.low <= support * 1.002 && last.close > support && last.close > last.open;
   const nearResistance = last.high >= resistance * 0.998 && last.close < resistance && last.close < last.open;
   if (nearSupport && last.close > prev.high) {
-    setups.push("Support bounce with bullish candle confirmation (trendline/SR proxy)");
+    setups.push("Support bounce with bullish candle confirmation (SR proxy, weak signal)");
     if (direction === "NONE") direction = "LONG";
   } else if (nearResistance && last.close < prev.low) {
-    setups.push("Resistance rejection with bearish candle confirmation (trendline/SR proxy)");
+    setups.push("Resistance rejection with bearish candle confirmation (SR proxy, weak signal)");
     if (direction === "NONE") direction = "SHORT";
   }
   return { direction, setups };
@@ -351,9 +368,7 @@ function detectAdditionalSetups(candles) {
 
 function analyzeDailyTrend(dailyCandles) {
   // Use completed daily candles only.
-
   const candles = dailyCandles.slice(0, -1);
-
   if (candles.length < 10) return "NEUTRAL";
 
   // Compare recent 5-candle and preceding 5-candle averages.
@@ -377,14 +392,8 @@ function analyzeDailyTrend(dailyCandles) {
   const risingClose = recentClose > previousClose;
   const fallingClose = recentClose < previousClose;
 
-  if (higherHighs && higherLows && risingClose) {
-    return "BULLISH";
-  }
-
-  if (lowerHighs && lowerLows && fallingClose) {
-    return "BEARISH";
-  }
-
+  if (higherHighs && higherLows && risingClose) return "BULLISH";
+  if (lowerHighs && lowerLows && fallingClose) return "BEARISH";
   return "CONSOLIDATION";
 }
 
@@ -392,35 +401,37 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
   const market = await getKrakenMarket(symbol);
 
   // 1. Daily Bias
-  const dailyCandles = await fetchCandles(
-    symbol,
-    "1d",
-    14,
-    24 * 60 * 60 * 1000,
-  );
+  const dailyCandles = await fetchCandles(symbol, "1d", 14, 24 * 60 * 60 * 1000);
   const dailyBias = analyzeDailyTrend(dailyCandles);
 
-  // 2. HTF POI Mapping (4H or 1H)
+  // 2. HTF candles (4H or 1H) for POI mapping
   const htfInterval = htfChoice === "1h" ? "1h" : "4h";
   const htfIntervalMs = htfChoice === "1h" ? 3600 * 1000 : 4 * 3600 * 1000;
   const htfCandles = await fetchCandles(symbol, htfInterval, 50, htfIntervalMs);
-  // Use closed candles and a tiny edge buffer to prevent live price flickering
   const closedCandles = htfCandles.slice(0, -1);
-  const zones = identifySupplyDemandZones(closedCandles);
-  const currentPrice = closedCandles[closedCandles.length - 1].close;
 
+  // 3. LTF candles (15m for 4H, 5m for 1H)
+  const ltfInterval = htfChoice === "1h" ? "5m" : "15m";
+  const ltfIntervalMs = htfChoice === "1h" ? 5 * 60 * 1000 : 15 * 60 * 1000;
+  const ltfCandles = await fetchCandles(symbol, ltfInterval, 30, ltfIntervalMs);
+  if (ltfCandles.length < 4 || closedCandles.length < 5) {
+    throw new Error("Not enough candle data returned.");
+  }
+
+  // Live price = close of the still-forming latest LTF candle (not a stale HTF close).
+  const livePrice = ltfCandles[ltfCandles.length - 1].close;
+
+  // Zones are newest-first and already exclude broken zones.
+  const zones = identifySupplyDemandZones(closedCandles);
   let activePoi = null;
   for (const zone of zones) {
-    if (currentPrice >= zone.low * 0.999 && currentPrice <= zone.high * 1.001) {
+    if (livePrice >= zone.low * 0.999 && livePrice <= zone.high * 1.001) {
       activePoi = zone;
       break;
     }
   }
 
-  // 3. LTF Confirmation (15m for 4H, 5m for 1H)
-  const ltfInterval = htfChoice === "1h" ? "5m" : "15m";
-  const ltfIntervalMs = htfChoice === "1h" ? 5 * 60 * 1000 : 15 * 60 * 1000;
-  const ltfCandles = await fetchCandles(symbol, ltfInterval, 30, ltfIntervalMs);
+  // LTF confirmation on the last two COMPLETED candles
   const lastLtf = ltfCandles[ltfCandles.length - 2];
   const prevLtf = ltfCandles[ltfCandles.length - 3];
 
@@ -433,24 +444,22 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
 
   const extraSetups = detectAdditionalSetups(ltfCandles);
 
-  // Scoring & Setup Decision
+  // Setup score = checklist count, NOT a win probability.
   let score = 40;
   let direction = "WAIT";
-  let reasons = [`Daily Bias: ${dailyBias}`];
+  const reasons = [`Daily Bias: ${dailyBias}`];
   reasons.push("Primary strategy: Supply & Demand + SMC + BOS confirmation");
   if (extraSetups.setups.length) {
-    reasons.push(...extraSetups.setups.map(setup => `Additional setup: ${setup}`));
+    reasons.push(...extraSetups.setups.map((setup) => `Additional setup: ${setup}`));
   } else {
     reasons.push("Additional setups: no confirmed liquidity sweep, break-and-retest, or S/R bounce on the latest completed candle");
   }
 
   if (activePoi) {
     score += 30;
-    reasons.push(
-      `Price testing ${htfChoice.toUpperCase()} ${activePoi.type} POI Zone`,
-    );
+    reasons.push(`Price testing ${htfChoice.toUpperCase()} ${activePoi.type} POI Zone`);
   } else {
-    reasons.push(`Price floating in equilibrium (No active POI test)`);
+    reasons.push("Price floating in equilibrium (No active POI test)");
   }
 
   if (ltfConfirmation !== "NONE") {
@@ -485,9 +494,10 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     reasons.push("Extra setup supports the bearish daily bias and supply POI.");
   }
 
-  let entry = currentPrice;
+  const entry = livePrice;
   let stopLoss = 0;
   let takeProfit = 0;
+  let slPct = 0;
 
   if (direction === "LONG" && activePoi) {
     stopLoss = activePoi.low * 0.998;
@@ -499,6 +509,19 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     takeProfit = entry - risk * 2.5;
   }
 
+  if (direction !== "WAIT") {
+    slPct = (Math.abs(entry - stopLoss) / entry) * 100;
+    if (!(slPct > 0) || slPct > MAX_SL_PCT) {
+      reasons.push(
+        `Setup skipped: stop-loss would be ${slPct.toFixed(2)}% away (max allowed ${MAX_SL_PCT}%). Too close to liquidation risk at high leverage.`,
+      );
+      direction = "WAIT";
+      stopLoss = 0;
+      takeProfit = 0;
+      slPct = 0;
+    }
+  }
+
   return {
     symbol: market.commandSymbol,
     direction,
@@ -506,6 +529,7 @@ export async function performMultiTimeframeAnalysis(symbol, htfChoice = "4h") {
     entry,
     stopLoss,
     takeProfit,
+    slPct,
     reasons,
   };
 }
@@ -523,13 +547,9 @@ async function loadMonitorState() {
   try {
     const saved = await readFile(MONITOR_FILE, "utf8");
     const monitors = JSON.parse(saved);
-
     for (const monitor of monitors) {
-      if (monitor?.id) {
-        activeMonitors.set(monitor.id, monitor);
-      }
+      if (monitor?.id) activeMonitors.set(monitor.id, monitor);
     }
-
     console.info(`Loaded ${activeMonitors.size} saved monitors.`);
   } catch (error) {
     if (error.code !== "ENOENT") {
@@ -540,11 +560,9 @@ async function loadMonitorState() {
 
 function saveMonitorState() {
   const snapshot = JSON.stringify([...activeMonitors.values()], null, 2);
-
   persistenceQueue = persistenceQueue
     .catch(() => {})
     .then(() => writeFile(MONITOR_FILE, snapshot, "utf8"));
-
   return persistenceQueue;
 }
 
@@ -556,40 +574,22 @@ async function registerMonitor(token, chatId, result) {
   const takeProfit = Number(result.takeProfit);
 
   if (
-    !Number.isFinite(entry) ||
-    !Number.isFinite(stopLoss) ||
-    !Number.isFinite(takeProfit) ||
-    entry <= 0 ||
-    stopLoss <= 0 ||
-    takeProfit <= 0
+    !Number.isFinite(entry) || !Number.isFinite(stopLoss) || !Number.isFinite(takeProfit) ||
+    entry <= 0 || stopLoss <= 0 || takeProfit <= 0
   ) {
-    await sendMessage(
-      token,
-      chatId,
-      "⚠️ Signal monitoring was not started because its price levels are invalid.",
-    );
+    await sendMessage(token, chatId, "⚠️ Signal monitoring was not started because its price levels are invalid.");
     return;
   }
 
-  const risk =
-    result.direction === "LONG" ? entry - stopLoss : stopLoss - entry;
-
+  const risk = result.direction === "LONG" ? entry - stopLoss : stopLoss - entry;
   if (risk <= 0) {
-    await sendMessage(
-      token,
-      chatId,
-      "⚠️ Signal monitoring was not started because the stop-loss is on the wrong side of the entry.",
-    );
+    await sendMessage(token, chatId, "⚠️ Signal monitoring was not started because the stop-loss is on the wrong side of the entry.");
     return;
   }
 
   const existing = [...activeMonitors.values()].find(
-    (m) =>
-      String(m.chatId) === String(chatId) &&
-      m.symbol === result.symbol &&
-      m.status === "ACTIVE",
+    (m) => String(m.chatId) === String(chatId) && m.symbol === result.symbol && m.status === "ACTIVE",
   );
-
   if (existing) {
     await sendMessage(
       token,
@@ -625,46 +625,19 @@ async function registerMonitor(token, chatId, result) {
       `🔔 *Monitoring started: ${monitor.symbol}*`,
       `Direction: ${monitor.direction}`,
       `Reference entry: ${formatPrice(entry)}`,
-      `+1R alert: ${formatPrice(
-        monitor.direction === "LONG" ? entry + risk : entry - risk,
-      )}`,
-      `−0.75R warning: ${formatPrice(
-        monitor.direction === "LONG"
-          ? entry - risk * 0.75
-          : entry + risk * 0.75,
-      )}`,
+      `+1R alert: ${formatPrice(monitor.direction === "LONG" ? entry + risk : entry - risk)}`,
+      `−0.75R warning: ${formatPrice(monitor.direction === "LONG" ? entry - risk * 0.75 : entry + risk * 0.75)}`,
       "This is monitoring only; no orders will be placed.",
     ].join("\n"),
   );
 }
 
-async function checkOneMonitor(token, monitor) {
-  if (monitor.status !== "ACTIVE") return;
-
-  const candles = await fetchCandles(monitor.symbol, "1m", 3, 60 * 1000);
-
-  if (!candles.length) return;
-
-  // Use the latest available one-minute candle's range.
-  const candle = candles[candles.length - 1];
-
-  if (
-    !Number.isFinite(candle.high) ||
-    !Number.isFinite(candle.low) ||
-    !Number.isFinite(candle.close)
-  ) {
-    return;
-  }
-
+// Checks ONE 1m candle against the monitor. Returns true if the monitor is finished.
+async function evaluateMonitorCandle(token, monitor, candle) {
   const isLong = monitor.direction === "LONG";
 
-  const hitStop = isLong
-    ? candle.low <= monitor.stopLoss
-    : candle.high >= monitor.stopLoss;
-
-  const hitTarget = isLong
-    ? candle.high >= monitor.takeProfit
-    : candle.low <= monitor.takeProfit;
+  const hitStop = isLong ? candle.low <= monitor.stopLoss : candle.high >= monitor.stopLoss;
+  const hitTarget = isLong ? candle.high >= monitor.takeProfit : candle.low <= monitor.takeProfit;
 
   // OHLC data cannot tell us which level was touched first
   // when both the stop-loss and take-profit are inside one candle.
@@ -674,10 +647,9 @@ async function checkOneMonitor(token, monitor) {
       monitor.chatId,
       `⚠️ *${monitor.symbol}: outcome unclear*\nThe same one-minute candle touched both the TP and SL levels. Candle data cannot confirm which was reached first. Monitoring stopped for this signal; check a more detailed price feed before deciding the outcome.`,
     );
-
     monitor.status = "AMBIGUOUS";
     await saveMonitorState();
-    return;
+    return true;
   }
 
   if (hitStop) {
@@ -686,10 +658,9 @@ async function checkOneMonitor(token, monitor) {
       monitor.chatId,
       `🔴 *${monitor.symbol}: stop-loss level touched*\nDirection: ${monitor.direction}\nSL reference: ${formatPrice(monitor.stopLoss)}\nThis is a price-level alert, not confirmation of an executed trade.`,
     );
-
     monitor.status = "STOP_TOUCHED";
     await saveMonitorState();
-    return;
+    return true;
   }
 
   if (hitTarget) {
@@ -698,48 +669,35 @@ async function checkOneMonitor(token, monitor) {
       monitor.chatId,
       `🎯 *${monitor.symbol}: take-profit level touched*\nDirection: ${monitor.direction}\nTP reference: ${formatPrice(monitor.takeProfit)}\nThis is a price-level alert, not confirmation of an executed trade.`,
     );
-
     monitor.status = "TARGET_TOUCHED";
     await saveMonitorState();
-    return;
+    return true;
   }
 
-  const hitOneR = isLong
-    ? candle.high >= monitor.entry + monitor.risk
+  const oneRLevel = isLong ? monitor.entry + monitor.risk : monitor.entry - monitor.risk;
+  const adverseLevel = isLong ? monitor.entry - monitor.risk * 0.75 : monitor.entry + monitor.risk * 0.75;
 
-        : candle.low <= monitor.entry - monitor.risk;
+  const hitOneR = isLong ? candle.high >= oneRLevel : candle.low <= oneRLevel;
+  const hitAdverse = isLong ? candle.low <= adverseLevel : candle.high >= adverseLevel;
 
-  const hitAdverse = isLong
-    ? candle.low <= monitor.entry - monitor.risk * 0.75
-    : candle.high >= monitor.entry + monitor.risk * 0.75;
-
-  if (
-    hitOneR &&
-    hitAdverse &&
-    !monitor.oneRAlerted &&
-    !monitor.adverseAlerted
-  ) {
+  if (hitOneR && hitAdverse && !monitor.oneRAlerted && !monitor.adverseAlerted) {
     await sendMessage(
       token,
       monitor.chatId,
       `⚠️ *${monitor.symbol}: movement order unclear*\nThe same one-minute candle touched both the +1R and −0.75R alert levels. Their order cannot be determined from candle data.`,
     );
-
     monitor.oneRAlerted = true;
     monitor.adverseAlerted = true;
     await saveMonitorState();
-    return;
+    return false;
   }
 
   if (hitOneR && !monitor.oneRAlerted) {
     await sendMessage(
       token,
       monitor.chatId,
-      `🟢 *${monitor.symbol}: +1R level reached*\nDirection: ${monitor.direction}\nReference entry: ${formatPrice(monitor.entry)}\nAlert level: ${formatPrice(
-        isLong ? monitor.entry + monitor.risk : monitor.entry - monitor.risk,
-      )}`,
+      `🟢 *${monitor.symbol}: +1R level reached*\nDirection: ${monitor.direction}\nReference entry: ${formatPrice(monitor.entry)}\nAlert level: ${formatPrice(oneRLevel)}`,
     );
-
     monitor.oneRAlerted = true;
     await saveMonitorState();
   }
@@ -748,18 +706,38 @@ async function checkOneMonitor(token, monitor) {
     await sendMessage(
       token,
       monitor.chatId,
-      `🟠 *${monitor.symbol}: −0.75R adverse warning*\nDirection: ${monitor.direction}\nReference entry: ${formatPrice(monitor.entry)}\nWarning level: ${formatPrice(
-        isLong
-          ? monitor.entry - monitor.risk * 0.75
-          : monitor.entry + monitor.risk * 0.75,
-      )}`,
+      `🟠 *${monitor.symbol}: −0.75R adverse warning*\nDirection: ${monitor.direction}\nReference entry: ${formatPrice(monitor.entry)}\nWarning level: ${formatPrice(adverseLevel)}`,
     );
-
     monitor.adverseAlerted = true;
     await saveMonitorState();
   }
 
-  monitor.lastCheckedCandle = candle.startTime;
+  return false;
+}
+
+async function checkOneMonitor(token, monitor) {
+  if (monitor.status !== "ACTIVE") return;
+
+  const candles = await fetchCandles(monitor.symbol, "1m", 15, 60 * 1000);
+  if (!candles.length) return;
+
+  // Only look at candles that started AFTER the signal was created,
+  // so price action from before the signal can't trigger alerts.
+  const firstValid = Math.ceil(Date.parse(monitor.createdAt) / 60000) * 60000;
+  const from = Math.max(firstValid, monitor.lastCheckedCandle ?? 0);
+
+  for (const candle of candles) {
+    if (candle.startTime < from) continue;
+    if (!Number.isFinite(candle.high) || !Number.isFinite(candle.low) || !Number.isFinite(candle.close)) continue;
+    const finished = await evaluateMonitorCandle(token, monitor, candle);
+    if (finished) return;
+  }
+
+  const newest = candles[candles.length - 1].startTime;
+  if (newest !== monitor.lastCheckedCandle) {
+    monitor.lastCheckedCandle = newest;
+    await saveMonitorState();
+  }
 }
 
 async function runMonitorLoop(token) {
@@ -767,7 +745,6 @@ async function runMonitorLoop(token) {
     try {
       for (const monitor of activeMonitors.values()) {
         if (monitor.status !== "ACTIVE") continue;
-
         try {
           await checkOneMonitor(token, monitor);
         } catch (error) {
@@ -777,7 +754,6 @@ async function runMonitorLoop(token) {
     } catch (error) {
       console.error("Monitoring loop error:", error.message);
     }
-
     await sleep(15000);
   }
 }
@@ -795,24 +771,35 @@ async function loadSubscribers() {
 }
 
 async function saveSubscribers() {
-  await writeFile(
-    SUBSCRIBERS_FILE,
-    JSON.stringify([...autoSubscribers]),
-    "utf8",
-  );
+  await writeFile(SUBSCRIBERS_FILE, JSON.stringify([...autoSubscribers]), "utf8");
+}
+
+function buildSignalLines(result) {
+  const icon = result.direction === "LONG" ? "📈" : result.direction === "SHORT" ? "📉" : "⏳";
+  const lines = [
+    `🪙 Pair: ${result.symbol}`,
+    `${icon} Signal: ${result.direction} (Setup score: ${result.score}/100)`,
+  ];
+  if (result.direction === "LONG" || result.direction === "SHORT") {
+    lines.push(
+      `🎯 Entry: ${formatPrice(result.entry)}`,
+      `🟢 TP: ${formatPrice(result.takeProfit)}`,
+      `🔴 SL: ${formatPrice(result.stopLoss)} (${result.slPct.toFixed(2)}% away)`,
+    );
+  } else {
+    lines.push(`Current price: ${formatPrice(result.entry)}`);
+  }
+  return lines;
 }
 
 function buildAlertMessage(result) {
-  const icon = result.direction === "LONG" ? "📈" : "📉";
   return [
     `🚨 *AUTO ALERT*`,
-    `🪙 Pair: ${result.symbol}`,
-    `${icon} Signal: ${result.direction} (Confidence:${result.score}%)`,
-    `🎯 Entry: ${formatPrice(result.entry)}`,
-    `🟢 TP: ${formatPrice(result.takeProfit)}`,
-    `🔴 SL: ${formatPrice(result.stopLoss)}`,
+    ...buildSignalLines(result),
     ``,
     ...result.reasons.map((r) => `• ${r}`),
+    ``,
+    `Setup score is a checklist count, not a win probability. Fees and funding are not included.`,
   ].join("\n");
 }
 
@@ -830,10 +817,7 @@ async function runAutoScan(token) {
             if (Date.now() - last < ALERT_COOLDOWN_MS) continue;
 
             const hasActive = [...activeMonitors.values()].some(
-              (m) =>
-                String(m.chatId) === String(chatId) &&
-                m.symbol === result.symbol &&
-                m.status === "ACTIVE",
+              (m) => String(m.chatId) === String(chatId) && m.symbol === result.symbol && m.status === "ACTIVE",
             );
             if (hasActive) continue;
 
@@ -850,28 +834,37 @@ async function runAutoScan(token) {
   }
 }
 
-async function callTelegram(token, method, body) {
+async function callTelegramRaw(token, method, body) {
   const res = await fetch(`${TELEGRAM_API}/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
+  return res.json();
+}
+
+async function callTelegram(token, method, body) {
+  const data = await callTelegramRaw(token, method, body);
   return data.result;
 }
 
 async function sendMessage(token, chatId, text) {
-  await callTelegram(token, "sendMessage", {
+  const data = await callTelegramRaw(token, "sendMessage", {
     chat_id: chatId,
     text,
     parse_mode: "Markdown",
   });
+  // If Telegram rejects the Markdown formatting, resend as plain text.
+  if (!data?.ok) {
+    await callTelegramRaw(token, "sendMessage", { chat_id: chatId, text });
+  }
 }
 
 async function handleMessage(token, message) {
+  if (!message) return;
   const text = message.text?.trim();
   if (!text || !message.chat?.id) return;
-  const match = text.match(/^(\/[a-z]+)(?:\s+(.+))?$/i);
+  const match = text.match(/^(\/[a-z]+)(?:@\w+)?(?:\s+(.+))?$/i);
   if (!match) return;
 
   const command = match[1].toLowerCase();
@@ -882,7 +875,14 @@ async function handleMessage(token, message) {
     await sendMessage(
       token,
       chatId,
-      "🤖 *Supply & Demand Multi-TF Bot*\n/analyze <symbol> — Top-Down Analysis (Daily + 4H POI + 15m)",
+      [
+        "🤖 *Supply & Demand Multi-TF Bot*",
+        "/analyze <symbol> — Top-Down Analysis (Daily + 4H POI + 15m)",
+        "/autoon — automatic S&D alerts ON",
+        "/autooff — automatic S&D alerts OFF",
+        "/autostatus — check auto alert status",
+        "/boshelp — BOS detector commands",
+      ].join("\n"),
     );
     return;
   }
@@ -893,25 +893,25 @@ async function handleMessage(token, message) {
       "/bos BTCUSDT — check 15m",
       "/bos BTCUSDT 1h — check 1h",
       "/bos BTCUSDT all — check all supported timeframes",
-      "/bosauto — subscribe to automatic BOS alerts",
+      "/bosauto — subscribe to automatic BOS alerts (15m and above)",
       "/bosstop — stop automatic BOS alerts",
       "",
       "Rules: confirmed swing pivot, completed candle close beyond the level, directional candle, and body >= 0.6 x ATR(14). Wick-only breaks do not qualify. Alerts are analysis only, not trade instructions.",
-    ].join("\\n"));
+    ].join("\n"));
     return;
   }
 
   if (command === "/bosauto") {
     bosSubscribers.add(String(chatId));
     await saveBosSubscribers();
-    await sendMessage(token, chatId, `✅ Automatic BOS alerts enabled. Watching ${BOS_SYMBOLS.join(", ")} across ${Object.keys(BOS_TIMEFRAMES).join(", ")}. Scans run about every 5 minutes. Use /bosstop to unsubscribe.`);
+    await sendMessage(token, chatId, `✅ Automatic BOS alerts enabled. Watching ${BOS_SYMBOLS.join(", ")} on ${BOS_AUTO_TIMEFRAMES.join(", ")}. Scans run about every 5 minutes. Use /bosstop to unsubscribe.`);
     return;
   }
 
   if (command === "/bosstop") {
     bosSubscribers.delete(String(chatId));
     await saveBosSubscribers();
-    await sendMessage(token, chatId, "🛑 Automatic BOS alerts disabled. Your existing S&D /auto alerts are unchanged.");
+    await sendMessage(token, chatId, "🛑 Automatic BOS alerts disabled. Your existing S&D /autoon alerts are unchanged.");
     return;
   }
 
@@ -935,7 +935,7 @@ async function handleMessage(token, message) {
         if (["BULLISH", "BEARISH"].includes(result.direction)) {
           await sendMessage(token, chatId, formatBosMessage(result));
         } else {
-          await sendMessage(token, chatId, `⚪ *NO VALID BOS*\\nPair: ${symbol}\\nTimeframe: ${timeframe}\\nReason: ${result.reason}`);
+          await sendMessage(token, chatId, `⚪ *NO VALID BOS*\nPair: ${symbol}\nTimeframe: ${timeframe}\nReason: ${result.reason}`);
         }
       } catch (error) {
         await sendMessage(token, chatId, `⚠️ BOS check failed for ${symbol} ${timeframe}: ${error.message}`);
@@ -972,7 +972,11 @@ async function handleMessage(token, message) {
     return;
   }
 
-  if (command === "/analyze" && args.length >= 1) {
+  if (command === "/analyze") {
+    if (args.length < 1) {
+      await sendMessage(token, chatId, "Usage: /analyze BTCUSDT");
+      return;
+    }
     const symbol = args[0].toUpperCase();
     await sendMessage(
       token,
@@ -981,22 +985,14 @@ async function handleMessage(token, message) {
     );
     try {
       const result = await performMultiTimeframeAnalysis(symbol, "4h");
-      const icon =
-        result.direction === "LONG"
-          ? "📈"
-          : result.direction === "SHORT"
-            ? "📉"
-            : "⏳";
 
       const msg = [
-        `🪙 Pair: ${result.symbol}`,
-        `${icon} Signal: ${result.direction} (Confidence:${result.score}%)`,
-        `🎯 Entry: ${formatPrice(result.entry)}`,
-        `🟢 TP: ${formatPrice(result.takeProfit)}`,
-        `🔴 SL: ${formatPrice(result.stopLoss)}`,
+        ...buildSignalLines(result),
         ``,
         `🔍 *Strategy Diagnostics:*`,
         ...result.reasons.map((r) => `• ${r}`),
+        ``,
+        `Setup score is a checklist count, not a win probability. Fees and funding are not included.`,
       ].join("\n");
 
       await sendMessage(token, chatId, msg);
@@ -1005,7 +1001,6 @@ async function handleMessage(token, message) {
           await registerMonitor(token, chatId, result);
         } catch (error) {
           console.error("Could not register signal monitor:", error.message);
-
           await sendMessage(
             token,
             chatId,
@@ -1014,11 +1009,7 @@ async function handleMessage(token, message) {
         }
       }
     } catch (err) {
-      await sendMessage(
-        token,
-        chatId,
-        `⚠️ Error analyzing ${symbol}: ${err.message}`,
-      );
+      await sendMessage(token, chatId, `⚠️ Error analyzing ${symbol}: ${err.message}`);
     }
   }
 }
@@ -1052,6 +1043,10 @@ export async function startBot(token) {
 
 async function main() {
   const token = process.env.BOT_TOKEN;
+  if (!token) {
+    console.error("BOT_TOKEN secret is missing. Add it in Replit Secrets.");
+    process.exit(1);
+  }
   await startBot(token);
 }
 
@@ -1060,4 +1055,4 @@ if (
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   main().catch(console.error);
-      }
+}
