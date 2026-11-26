@@ -1,0 +1,14 @@
+{
+  "name": "telegram-signal-bot",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Telegram futures signals for BTC, ETH and SOL using Kraken Futures data, stricter signal quality gates and crypto news risk checks.",
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test"
+  }
+}
